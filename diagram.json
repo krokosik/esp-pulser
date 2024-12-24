@@ -6,11 +6,18 @@
         {
             "type": "board-esp32-s3-devkitc-1",
             "id": "esp",
-            "top": 0.59,
-            "left": 0.67,
+            "top": 268.8,
+            "left": 81.64,
             "attrs": {
                 "flashSize": "16"
             }
+        },
+        {
+            "type": "wokwi-ili9341",
+            "id": "display",
+            "top": -95.2,
+            "left": 47.7,
+            "attrs": {}
         }
     ],
     "connections": [
@@ -25,6 +32,88 @@
             "$serialMonitor:TX",
             "",
             []
+        ],
+        [
+            "esp:5V",
+            "display:VCC",
+            "red",
+            [
+                "h-38.25",
+                "v-230.4",
+                "h38.4"
+            ]
+        ],
+        [
+            "display:LED",
+            "esp:5V",
+            "red",
+            [
+                "v48",
+                "h-115.21",
+                "v230.4"
+            ]
+        ],
+        [
+            "display:GND",
+            "esp:GND.2",
+            "black",
+            [
+                "v28.8",
+                "h96",
+                "v38.4"
+            ]
+        ],
+        [
+            "display:CS",
+            "esp:42",
+            "green",
+            [
+                "v19.2",
+                "h96",
+                "v134.4"
+            ]
+        ],
+        [
+            "display:RST",
+            "esp:41",
+            "blue",
+            [
+                "v38.4",
+                "h67.2",
+                "v144"
+            ]
+        ],
+        [
+            "display:D/C",
+            "esp:40",
+            "violet",
+            [
+                "h86.4",
+                "v172.8",
+                "h0",
+                "v9.6",
+                "h-38.4"
+            ]
+        ],
+        [
+            "display:MOSI",
+            "esp:35",
+            "yellow",
+            [
+                "v67.2",
+                "h86.39",
+                "v48"
+            ]
+        ],
+        [
+            "display:SCK",
+            "esp:36",
+            "orange",
+            [
+                "v76.8",
+                "h86.39",
+                "v105.6"
+            ]
         ]
     ],
     "serialMonitor": {
