@@ -1,9 +1,10 @@
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
+use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use mipidsi::{models::ST7789, options::*, Builder};
 
-use esp_idf_svc::hal::{delay, gpio::*, prelude::*, spi, units::FromValueType};
+use esp_idf_svc::hal::{delay, gpio::*, i2c, prelude::*, spi, units::FromValueType};
 
 use log::info;
 
@@ -27,6 +28,17 @@ fn main() -> Result<(), anyhow::Error> {
     // let eth_cs = pins.gpio10;
     let rst = PinDriver::output(pins.gpio41)?;
 
+    let i2c = peripherals.i2c0;
+    let sda = pins.gpio3;
+    let scl = pins.gpio4;
+
+    let i2c_driver = i2c::I2cDriver::new(
+        i2c,
+        sda,
+        scl,
+        &i2c::config::Config::new().baudrate(400.kHz().into()),
+    )?;
+
     let mut tft_power = PinDriver::output(pins.gpio7)?;
     let mut backlight = PinDriver::output(pins.gpio45)?;
 
@@ -36,6 +48,15 @@ fn main() -> Result<(), anyhow::Error> {
     backlight.set_high()?;
 
     info!("Display power on");
+
+    let mut haptic = Drv2605::new(i2c_driver);
+
+    info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
+
+    info!(
+        "Haptic driver effect set to: {:?}",
+        haptic.set_single_effect(Effect::PulsingStrongOne100)
+    );
 
     let config = spi::config::Config::new()
         .baudrate(26.MHz().into())
@@ -87,6 +108,8 @@ fn main() -> Result<(), anyhow::Error> {
         .map_err(|_| anyhow!("draw text"))?;
 
     info!("Text drawn");
+
+    haptic.set_go(true)?;
 
     loop {
         delay::FreeRtos::delay_ms(1000);
