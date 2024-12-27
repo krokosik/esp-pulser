@@ -1,9 +1,7 @@
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
-use embedded_graphics::primitives::PrimitiveStyleBuilder;
-use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
-use mipidsi::options::*;
-use mipidsi::{models::ST7789, options::Orientation, Builder};
+use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
+use mipidsi::{models::ST7789, options::*, Builder};
 
 use esp_idf_svc::hal::{delay, gpio::*, prelude::*, spi, units::FromValueType};
 
@@ -60,9 +58,9 @@ fn main() -> Result<(), anyhow::Error> {
     let di = SPIInterface::new(tft_spi_device, dc);
     let mut display = Builder::new(ST7789, di)
         .display_size(135, 240)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
         .display_offset(52, 40)
         .invert_colors(ColorInversion::Inverted)
-        .orientation(Orientation::new().rotate(Rotation::Deg180))
         .reset_pin(rst)
         .init(&mut delay)
         .map_err(|_| anyhow!("display init"))?;
@@ -73,18 +71,22 @@ fn main() -> Result<(), anyhow::Error> {
         .clear(Rgb565::RED)
         .map_err(|_| anyhow!("clear display"))?;
 
-    let style = PrimitiveStyleBuilder::new()
-        .stroke_color(Rgb565::BLACK)
-        .stroke_width(3)
-        .fill_color(Rgb565::GREEN)
+    info!("Display cleared");
+
+    let character_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
+
+    // Create a new text style.
+    let text_style = TextStyleBuilder::new()
+        .alignment(Alignment::Center)
+        .line_height(LineHeight::Percent(150))
         .build();
 
-    Rectangle::new(Point::new(0, 0), Size::new(100, 100))
-        .into_styled(style)
+    // Create a text at position (20, 30) and draw it using the previously defined style.
+    Text::with_text_style("Test", Point::new(100, 30), character_style, text_style)
         .draw(&mut display)
-        .map_err(|_| anyhow!("draw rectangle"))?;
+        .map_err(|_| anyhow!("draw text"))?;
 
-    info!("Display cleared");
+    info!("Text drawn");
 
     loop {
         delay::FreeRtos::delay_ms(1000);
