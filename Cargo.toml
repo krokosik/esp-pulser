@@ -5,6 +5,7 @@ authors = ["krokosik <wikkra@gmail.com>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
+runner = "espflash flash --monitor"
 
 [[bin]]
 name = "esp-pulser"
