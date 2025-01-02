@@ -56,12 +56,16 @@ fn main() -> Result<(), anyhow::Error> {
     // let eth_cs = pins.gpio10;
     let rst = PinDriver::output(pins.gpio41)?;
 
-    let pulse_input = pins.gpio16;
-    let mut adc = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
-    let mut adc_config = adc::oneshot::config::AdcChannelConfig::new();
-    adc_config.attenuation = adc::attenuation::DB_11;
-    adc_config.calibration = true;
-    let mut adc_pin = adc::oneshot::AdcChannelDriver::new(&mut adc, pulse_input, &adc_config)?;
+    info!("Starting ADC");
+    let adc_config = adc::AdcContConfig::default();
+    let adc_channel = adc::Attenuated::db11(pins.gpio8);
+    let mut adc = adc::AdcContDriver::new(peripherals.adc1, &adc_config, adc_channel)?;
+
+    adc.start()?;
+
+    info!("ADC started");
+
+    let mut samples = [adc::AdcMeasurement::default(); 100];
 
     // let i2c = peripherals.i2c0;
     // let sda = pins.gpio3;
@@ -150,9 +154,12 @@ fn main() -> Result<(), anyhow::Error> {
 
     block_on(async {
         loop {
-            timer.delay(timer.tick_hz() / 2).await?;
-
-            println!("ADC value: {}", adc_pin.read()?);
+            if let Ok(num_read) = adc.read(&mut samples, 10) {
+                info!("Read {} measurement.", num_read);
+                // for index in 0..num_read {
+                //     info!("{}", samples[index].data());
+                // }
+            }
         }
     })
 }
