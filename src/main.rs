@@ -1,12 +1,25 @@
+use std::env;
+
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
-use drv2605::{Drv2605, Effect};
+// use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
+use esp_idf_svc::hal::modem::WifiModemPeripheral;
+use esp_idf_svc::timer::EspTaskTimerService;
+use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
 use mipidsi::{models::ST7789, options::*, Builder};
 
-use esp_idf_svc::hal::{delay, gpio::*, i2c, prelude::*, spi, units::FromValueType};
+use esp_idf_svc::hal::{
+    adc, delay, gpio::*, i2c, prelude::*, spi, task::*, timer::*, units::FromValueType,
+};
 
 use log::info;
+
+const SSID: &str = env!("WIFI_SSID");
+const PASSWORD: &str = env!("WIFI_PASS");
+
+// mod pulse_sensor;
 
 fn main() -> Result<(), anyhow::Error> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -17,6 +30,21 @@ fn main() -> Result<(), anyhow::Error> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     let peripherals = Peripherals::take()?;
+    let sys_loop = EspSystemEventLoop::take()?;
+    let timer_service = EspTaskTimerService::new()?;
+    let nvs = EspDefaultNvsPartition::take()?;
+
+    let wifi = block_on_send(connect_wifi(
+        peripherals.modem,
+        sys_loop.clone(),
+        nvs,
+        timer_service,
+    ))?;
+
+    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+
+    info!("Wifi DHCP info: {:?}", ip_info);
+
     let pins = peripherals.pins;
 
     let spi = peripherals.spi2;
@@ -28,16 +56,23 @@ fn main() -> Result<(), anyhow::Error> {
     // let eth_cs = pins.gpio10;
     let rst = PinDriver::output(pins.gpio41)?;
 
-    let i2c = peripherals.i2c0;
-    let sda = pins.gpio3;
-    let scl = pins.gpio4;
+    let pulse_input = pins.gpio16;
+    let mut adc = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
+    let mut adc_config = adc::oneshot::config::AdcChannelConfig::new();
+    adc_config.attenuation = adc::attenuation::DB_11;
+    adc_config.calibration = true;
+    let mut adc_pin = adc::oneshot::AdcChannelDriver::new(&mut adc, pulse_input, &adc_config)?;
 
-    let i2c_driver = i2c::I2cDriver::new(
-        i2c,
-        sda,
-        scl,
-        &i2c::config::Config::new().baudrate(400.kHz().into()),
-    )?;
+    // let i2c = peripherals.i2c0;
+    // let sda = pins.gpio3;
+    // let scl = pins.gpio4;
+
+    // let i2c_driver = i2c::I2cDriver::new(
+    //     i2c,
+    //     sda,
+    //     scl,
+    //     &i2c::config::Config::new().baudrate(400.kHz().into()),
+    // )?;
 
     let mut tft_power = PinDriver::output(pins.gpio7)?;
     let mut backlight = PinDriver::output(pins.gpio45)?;
@@ -49,14 +84,16 @@ fn main() -> Result<(), anyhow::Error> {
 
     info!("Display power on");
 
-    let mut haptic = Drv2605::new(i2c_driver);
+    // let mut haptic = Drv2605::new(i2c_driver);
 
-    info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
+    // info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
 
-    info!(
-        "Haptic driver effect set to: {:?}",
-        haptic.set_single_effect(Effect::PulsingStrongOne100)
-    );
+    // info!(
+    //     "Haptic driver effect set to: {:?}",
+    //     haptic.set_single_effect(Effect::Alert1000ms)
+    // );
+
+    // haptic.set_go(true)?;
 
     let config = spi::config::Config::new()
         .baudrate(26.MHz().into())
@@ -109,9 +146,58 @@ fn main() -> Result<(), anyhow::Error> {
 
     info!("Text drawn");
 
-    haptic.set_go(true)?;
+    let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
-    loop {
-        delay::FreeRtos::delay_ms(1000);
-    }
+    block_on(async {
+        loop {
+            timer.delay(timer.tick_hz() / 2).await?;
+
+            println!("ADC value: {}", adc_pin.read()?);
+        }
+    })
+}
+
+fn block_on_send<F>(f: F) -> F::Output
+where
+    F: core::future::Future + Send + 'static, // These constraints are why this additional example exists in the first place
+{
+    block_on(f)
+}
+
+async fn connect_wifi<M>(
+    modem: M,
+    sys_loop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition,
+    timer_service: EspTaskTimerService,
+) -> anyhow::Result<AsyncWifi<EspWifi<'static>>>
+where
+    M: WifiModemPeripheral + 'static,
+{
+    let mut wifi = AsyncWifi::wrap(
+        EspWifi::new(modem, sys_loop.clone(), Some(nvs))?,
+        sys_loop,
+        timer_service,
+    )?;
+
+    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
+        ssid: SSID.try_into().unwrap(),
+        bssid: None,
+        auth_method: AuthMethod::WPA2Personal,
+        password: PASSWORD.try_into().unwrap(),
+        channel: None,
+        ..Default::default()
+    });
+
+    wifi.set_configuration(&wifi_configuration)?;
+
+    wifi.start().await?;
+    info!("Wifi started");
+
+    wifi.connect().await?;
+    info!("Wifi connected");
+
+    wifi.wait_netif_up().await?;
+    info!("Wifi netif up");
+
+    Ok(wifi)
 }

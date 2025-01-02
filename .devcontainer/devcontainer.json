@@ -37,12 +37,13 @@
       "extensions": [
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
-        "serayuzgur.crates",
+        "fill-labs.dependi",
         "mutantdino.resourcemonitor",
         "yzhang.markdown-all-in-one",
         "ms-vscode.cpptools",
         "actboy168.tasks",
-        "Wokwi.wokwi-vscode"
+        "Wokwi.wokwi-vscode",
+        "ms-azuretools.vscode-docker"
       ]
     }
   },
