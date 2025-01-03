@@ -5,7 +5,6 @@ authors = ["krokosik <wikkra@gmail.com>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
-runner = "cargo espflash flash --partition-table=partitions.csv --monitor"
 
 [[bin]]
 name = "esp-pulser"
