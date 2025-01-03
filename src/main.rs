@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
-// use drv2605::{Drv2605, Effect};
+use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::hal::modem::WifiModemPeripheral;
 use esp_idf_svc::ipv4;
@@ -51,109 +51,112 @@ fn main() -> Result<(), anyhow::Error> {
 
     let pins = peripherals.pins;
 
-    let spi = peripherals.spi2;
-    let dc = PinDriver::output(pins.gpio40)?;
-    let sclk = pins.gpio36;
-    let sdo = pins.gpio35; // mosi
-    let sdi = pins.gpio37; // miso
-    let tft_cs = pins.gpio42;
-    // let eth_cs = pins.gpio10;
-    let rst = PinDriver::output(pins.gpio41)?;
-
     info!("Starting ADC");
-    let adc_config = adc::oneshot::config::AdcChannelConfig {
-        attenuation: adc::attenuation::DB_11,
-        ..Default::default()
-    };
-    let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
-    let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio16, &adc_config)?;
+    // let adc_config = adc::oneshot::config::AdcChannelConfig {
+    //     attenuation: adc::attenuation::DB_11,
+    //     ..Default::default()
+    // };
+    // let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
+    // let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio16, &adc_config)?;
+    let mut bpm_input = PinDriver::input(pins.gpio16)?;
 
     info!("ADC started");
 
-    let mut samples = [0u8; 1024];
+    // #################################### HAPTIC ###############################################
+    let mut haptic = {
+        let i2c = peripherals.i2c0;
+        let sda = pins.gpio3;
+        let scl = pins.gpio4;
 
-    // let i2c = peripherals.i2c0;
-    // let sda = pins.gpio3;
-    // let scl = pins.gpio4;
+        let i2c_driver = i2c::I2cDriver::new(
+            i2c,
+            sda,
+            scl,
+            &i2c::config::Config::new().baudrate(400.kHz().into()),
+        )?;
 
-    // let i2c_driver = i2c::I2cDriver::new(
-    //     i2c,
-    //     sda,
-    //     scl,
-    //     &i2c::config::Config::new().baudrate(400.kHz().into()),
-    // )?;
+        let mut haptic = Drv2605::new(i2c_driver);
 
-    let mut tft_power = PinDriver::output(pins.gpio7)?;
-    let mut backlight = PinDriver::output(pins.gpio45)?;
+        info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
 
-    info!("Pins initialized");
+        info!(
+            "Haptic driver effect set to: {:?}",
+            haptic.set_single_effect(Effect::PulsingStrongOne100)
+        );
 
-    tft_power.set_high()?;
-    backlight.set_high()?;
+        haptic
+    };
 
-    info!("Display power on");
+    // #################################### DISPLAY ###############################################
+    let mut display = {
+        let spi = peripherals.spi2;
+        let dc = PinDriver::output(pins.gpio40)?;
+        let sclk = pins.gpio36;
+        let sdo = pins.gpio35; // mosi
+        let sdi = pins.gpio37; // miso
+        let tft_cs = pins.gpio42;
+        // let eth_cs = pins.gpio10;
+        let rst = PinDriver::output(pins.gpio41)?;
 
-    // let mut haptic = Drv2605::new(i2c_driver);
+        let mut tft_power = PinDriver::output(pins.gpio7)?;
+        let mut backlight = PinDriver::output(pins.gpio45)?;
 
-    // info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
+        tft_power.set_high()?;
+        backlight.set_high()?;
 
-    // info!(
-    //     "Haptic driver effect set to: {:?}",
-    //     haptic.set_single_effect(Effect::Alert1000ms)
-    // );
+        info!("Display power on");
 
-    // haptic.set_go(true)?;
+        let config = spi::config::Config::new()
+            .baudrate(26.MHz().into())
+            .data_mode(spi::config::MODE_3);
 
-    let config = spi::config::Config::new()
-        .baudrate(26.MHz().into())
-        .data_mode(spi::config::MODE_3);
+        let spi_driver = spi::SpiDriver::new(
+            spi,
+            sclk,
+            sdo,
+            Some(sdi),
+            &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(240 * 135 * 2 + 8)),
+        )?;
 
-    let spi_driver = spi::SpiDriver::new(
-        spi,
-        sclk,
-        sdo,
-        Some(sdi),
-        &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(240 * 135 * 2 + 8)),
-    )?;
+        let tft_spi_device = spi::SpiDeviceDriver::new(spi_driver, Some(tft_cs), &config)?;
 
-    let tft_spi_device = spi::SpiDeviceDriver::new(&spi_driver, Some(tft_cs), &config)?;
+        info!("SPI initialized");
 
-    info!("SPI initialized");
+        let mut delay = delay::Ets;
 
-    let mut delay = delay::Ets;
+        let di = SPIInterface::new(tft_spi_device, dc);
+        let mut display = Builder::new(ST7789, di)
+            .display_size(135, 240)
+            .orientation(Orientation::new().rotate(Rotation::Deg90))
+            .display_offset(52, 40)
+            .invert_colors(ColorInversion::Inverted)
+            .reset_pin(rst)
+            .init(&mut delay)
+            .map_err(|_| anyhow!("display init"))?;
 
-    let di = SPIInterface::new(tft_spi_device, dc);
-    let mut display = Builder::new(ST7789, di)
-        .display_size(135, 240)
-        .orientation(Orientation::new().rotate(Rotation::Deg90))
-        .display_offset(52, 40)
-        .invert_colors(ColorInversion::Inverted)
-        .reset_pin(rst)
-        .init(&mut delay)
-        .map_err(|_| anyhow!("display init"))?;
+        info!("Display initialized");
 
-    info!("Display initialized");
+        display
+            .clear(Rgb565::RED)
+            .map_err(|_| anyhow!("clear display"))?;
 
-    display
-        .clear(Rgb565::RED)
-        .map_err(|_| anyhow!("clear display"))?;
+        info!("Display cleared");
 
-    info!("Display cleared");
+        let character_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
 
-    let character_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
+        // Create a new text style.
+        let text_style = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .line_height(LineHeight::Percent(150))
+            .build();
 
-    // Create a new text style.
-    let text_style = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .line_height(LineHeight::Percent(150))
-        .build();
+        // Create a text at position (20, 30) and draw it using the previously defined style.
+        Text::with_text_style("Test", Point::new(100, 30), character_style, text_style)
+            .draw(&mut display)
+            .map_err(|_| anyhow!("draw text"))?;
 
-    // Create a text at position (20, 30) and draw it using the previously defined style.
-    Text::with_text_style("Test", Point::new(100, 30), character_style, text_style)
-        .draw(&mut display)
-        .map_err(|_| anyhow!("draw text"))?;
-
-    info!("Text drawn");
+        display
+    };
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
@@ -161,18 +164,28 @@ fn main() -> Result<(), anyhow::Error> {
     socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 45), 34254))?;
     info!("Socket bound to {:?}", socket.local_addr()?);
 
+    bpm_input.set_pull(Pull::Down)?;
+
     block_on(async {
         loop {
-            timer.delay(timer.tick_hz() / 500).await?;
+            bpm_input.wait_for_high().await?;
 
-            let res = adc.read()?;
-            match socket.send(&res.to_be_bytes()) {
-                Ok(_) => (),
-                Err(e) => {
-                    warn!("Error sending data: {:?}", e);
-                    continue;
-                }
-            }
+            haptic.set_go(true)?;
+
+            bpm_input.wait_for_low().await?;
+
+            haptic.set_go(false)?;
+
+            // timer.delay(timer.tick_hz()).await?;
+
+            // let res = adc.read()?;
+            // match socket.send(&res.to_be_bytes()) {
+            //     Ok(_) => (),
+            //     Err(e) => {
+            //         warn!("Error sending data: {:?}", e);
+            //         continue;
+            //     }
+            // }
         }
     })
 }
