@@ -1,13 +1,17 @@
 use std::env;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
 // use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::hal::modem::WifiModemPeripheral;
+use esp_idf_svc::ipv4;
+use esp_idf_svc::ping;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
+use log::warn;
 use mipidsi::{models::ST7789, options::*, Builder};
 
 use esp_idf_svc::hal::{
@@ -57,15 +61,16 @@ fn main() -> Result<(), anyhow::Error> {
     let rst = PinDriver::output(pins.gpio41)?;
 
     info!("Starting ADC");
-    let adc_config = adc::AdcContConfig::default();
-    let adc_channel = adc::Attenuated::db11(pins.gpio8);
-    let mut adc = adc::AdcContDriver::new(peripherals.adc1, &adc_config, adc_channel)?;
-
-    adc.start()?;
+    let adc_config = adc::oneshot::config::AdcChannelConfig {
+        attenuation: adc::attenuation::DB_11,
+        ..Default::default()
+    };
+    let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
+    let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio16, &adc_config)?;
 
     info!("ADC started");
 
-    let mut samples = [adc::AdcMeasurement::default(); 100];
+    let mut samples = [0u8; 1024];
 
     // let i2c = peripherals.i2c0;
     // let sda = pins.gpio3;
@@ -152,13 +157,21 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3333))?;
+    socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 45), 34254))?;
+    info!("Socket bound to {:?}", socket.local_addr()?);
+
     block_on(async {
         loop {
-            if let Ok(num_read) = adc.read(&mut samples, 10) {
-                info!("Read {} measurement.", num_read);
-                // for index in 0..num_read {
-                //     info!("{}", samples[index].data());
-                // }
+            timer.delay(timer.tick_hz() / 500).await?;
+
+            let res = adc.read()?;
+            match socket.send(&res.to_be_bytes()) {
+                Ok(_) => (),
+                Err(e) => {
+                    warn!("Error sending data: {:?}", e);
+                    continue;
+                }
             }
         }
     })
@@ -207,4 +220,17 @@ where
     info!("Wifi netif up");
 
     Ok(wifi)
+}
+
+fn ping(ip: ipv4::Ipv4Addr) -> Result<(), anyhow::Error> {
+    info!("About to do some pings for {:?}", ip);
+
+    let ping_summary = ping::EspPing::default().ping(ip, &Default::default())?;
+    if ping_summary.transmitted != ping_summary.received {
+        warn!("Pinging IP {} resulted in timeouts", ip);
+    }
+
+    info!("Pinging done");
+
+    Ok(())
 }
