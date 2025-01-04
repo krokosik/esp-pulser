@@ -1,17 +1,19 @@
-use std::env;
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::io::Read;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::{env, thread};
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
 use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::hal::modem::WifiModemPeripheral;
-use esp_idf_svc::ipv4;
+use esp_idf_svc::ipv4::{self, IpInfo};
 use esp_idf_svc::ping;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use log::warn;
+use log::{error, warn};
 use mipidsi::{models::ST7789, options::*, Builder};
 
 use esp_idf_svc::hal::{
@@ -23,7 +25,22 @@ use log::info;
 const SSID: &str = env!("WIFI_SSID");
 const PASSWORD: &str = env!("WIFI_PASS");
 
-// mod pulse_sensor;
+#[derive(Debug)]
+struct Status {
+    haptic: bool,
+    display: bool,
+    network: bool,
+    adc: bool,
+    ip_info: Option<IpInfo>,
+    target_ip: Option<Ipv4Addr>,
+    target_port: Option<u16>,
+}
+
+impl Status {
+    fn is_ok(&self) -> bool {
+        self.haptic && self.display && self.network && self.adc
+    }
+}
 
 fn main() -> Result<(), anyhow::Error> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -43,9 +60,18 @@ fn main() -> Result<(), anyhow::Error> {
         sys_loop.clone(),
         nvs,
         timer_service,
-    ))?;
+    ));
 
-    let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+    let ip_info = match &wifi {
+        Ok(wifi) => {
+            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
+            Some(ip_info)
+        }
+        Err(e) => {
+            warn!("Error connecting to wifi: {:?}", e);
+            None
+        }
+    };
 
     info!("Wifi DHCP info: {:?}", ip_info);
 
@@ -59,11 +85,12 @@ fn main() -> Result<(), anyhow::Error> {
     // let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
     // let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio16, &adc_config)?;
     let mut bpm_input = PinDriver::input(pins.gpio16)?;
+    bpm_input.set_pull(Pull::Down)?;
 
     info!("ADC started");
 
     // #################################### HAPTIC ###############################################
-    let mut haptic = {
+    let haptic: Result<Drv2605<i2c::I2cDriver<'_>>, anyhow::Error> = (|| {
         let i2c = peripherals.i2c0;
         let sda = pins.gpio3;
         let scl = pins.gpio4;
@@ -77,18 +104,14 @@ fn main() -> Result<(), anyhow::Error> {
 
         let mut haptic = Drv2605::new(i2c_driver);
 
-        info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
+        haptic.init_open_loop_erm()?;
+        haptic.set_single_effect(Effect::PulsingStrongOne100)?;
 
-        info!(
-            "Haptic driver effect set to: {:?}",
-            haptic.set_single_effect(Effect::PulsingStrongOne100)
-        );
-
-        haptic
-    };
+        Ok(haptic)
+    })();
 
     // #################################### DISPLAY ###############################################
-    let mut display = {
+    let display: Result<mipidsi::Display<_, ST7789, _>, anyhow::Error> = (|| {
         let spi = peripherals.spi2;
         let dc = PinDriver::output(pins.gpio40)?;
         let sclk = pins.gpio36;
@@ -142,29 +165,88 @@ fn main() -> Result<(), anyhow::Error> {
 
         info!("Display cleared");
 
-        let character_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
-
-        // Create a new text style.
-        let text_style = TextStyleBuilder::new()
-            .alignment(Alignment::Center)
-            .line_height(LineHeight::Percent(150))
-            .build();
-
         // Create a text at position (20, 30) and draw it using the previously defined style.
-        Text::with_text_style("Test", Point::new(100, 30), character_style, text_style)
-            .draw(&mut display)
-            .map_err(|_| anyhow!("draw text"))?;
+        Text::with_text_style(
+            "Test",
+            Point::new(100, 30),
+            CHARACTER_STYLE_WHITE,
+            TEXT_STYLE,
+        )
+        .draw(&mut display)
+        .map_err(|_| anyhow!("draw text"))?;
 
-        display
-    };
+        Ok(display)
+    })();
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3333))?;
-    socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 45), 34254))?;
     info!("Socket bound to {:?}", socket.local_addr()?);
 
-    bpm_input.set_pull(Pull::Down)?;
+    let mut status = Arc::new(Mutex::new(Status {
+        haptic: true, //haptic.is_ok(),
+        display: display.is_ok(),
+        network: wifi.is_ok(),
+        adc: true,
+        ip_info,
+        target_ip: None,
+        target_port: None,
+    }));
+
+    {
+        let status = status.clone();
+        thread::spawn(move || {
+            let socket =
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3334)).unwrap();
+
+            match socket.accept() {
+                Ok((mut stream, addr)) => {
+                    info!("Connection from: {:?}", addr);
+
+                    let mut buf = [0; 1024];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => {
+                                info!("Connection closed");
+                                let mut status = status.lock().unwrap();
+                                status.target_ip = None;
+                                status.target_port = None;
+                                break;
+                            }
+                            Ok(n) => {
+                                let data = &buf[..n];
+                                let data = std::str::from_utf8(data).unwrap();
+                                info!("Received: {}", data);
+
+                                if let Ok(addr) = data.parse::<SocketAddrV4>() {
+                                    let mut status = status.lock().unwrap();
+                                    status.target_ip = Some(*addr.ip());
+                                    status.target_port = Some(addr.port());
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Error receiving data: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error accepting connection: {:?}", e);
+                }
+            }
+        });
+    }
+
+    {
+        if !status.lock().unwrap().is_ok() {
+            error!("Not all systems are ready: {:?}", status);
+            return Err(anyhow!("Not all systems are ready"));
+        }
+    }
+
+    let mut haptic = haptic.unwrap();
+    let mut display = display.unwrap();
 
     block_on(async {
         loop {
@@ -172,20 +254,25 @@ fn main() -> Result<(), anyhow::Error> {
 
             haptic.set_go(true)?;
 
-            bpm_input.wait_for_low().await?;
+            // if let Ok(status) = status.try_lock() {
+            //     if let Some(target_ip) = status.target_ip {
+            //         if let Some(target_port) = status.target_port {
+            //             let ip = target_ip;
+            //             let port = target_port;
 
-            haptic.set_go(false)?;
-
-            // timer.delay(timer.tick_hz()).await?;
-
-            // let res = adc.read()?;
-            // match socket.send(&res.to_be_bytes()) {
-            //     Ok(_) => (),
-            //     Err(e) => {
-            //         warn!("Error sending data: {:?}", e);
-            //         continue;
+            //             match socket.send_to(&[1; 1], SocketAddrV4::new(ip, port)) {
+            //                 Ok(_) => (),
+            //                 Err(e) => {
+            //                     warn!("Error sending data: {:?}", e);
+            //                 }
+            //             };
+            //         }
             //     }
             // }
+
+            timer.delay(timer.tick_hz() / 10).await?;
+
+            haptic.set_go(false)?;
         }
     })
 }
@@ -247,3 +334,17 @@ fn ping(ip: ipv4::Ipv4Addr) -> Result<(), anyhow::Error> {
 
     Ok(())
 }
+
+const CHARACTER_STYLE_WHITE: MonoTextStyle<'_, Rgb565> =
+    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
+
+const CHARACTER_STYLE_GREEN: MonoTextStyle<'_, Rgb565> =
+    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::GREEN);
+
+const CHARACTER_STYLE_RED: MonoTextStyle<'_, Rgb565> =
+    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::RED);
+
+const TEXT_STYLE: TextStyle = TextStyleBuilder::new()
+    .alignment(Alignment::Center)
+    .line_height(LineHeight::Percent(150))
+    .build();
