@@ -1,19 +1,16 @@
-use std::io::Read;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
-use std::{env, thread};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
 use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
-use esp_idf_svc::hal::modem::WifiModemPeripheral;
-use esp_idf_svc::ipv4::{self, IpInfo};
+use esp_idf_svc::eth;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::ipv4;
 use esp_idf_svc::ping;
+use esp_idf_svc::sys::EspError;
 use esp_idf_svc::timer::EspTaskTimerService;
-use esp_idf_svc::wifi::{AsyncWifi, AuthMethod, ClientConfiguration, Configuration, EspWifi};
-use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
-use log::{error, warn};
+use log::warn;
 use mipidsi::{models::ST7789, options::*, Builder};
 
 use esp_idf_svc::hal::{
@@ -21,26 +18,6 @@ use esp_idf_svc::hal::{
 };
 
 use log::info;
-
-const SSID: &str = env!("WIFI_SSID");
-const PASSWORD: &str = env!("WIFI_PASS");
-
-#[derive(Debug)]
-struct Status {
-    haptic: bool,
-    display: bool,
-    network: bool,
-    adc: bool,
-    ip_info: Option<IpInfo>,
-    target_ip: Option<Ipv4Addr>,
-    target_port: Option<u16>,
-}
-
-impl Status {
-    fn is_ok(&self) -> bool {
-        self.haptic && self.display && self.network && self.adc
-    }
-}
 
 fn main() -> Result<(), anyhow::Error> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
@@ -53,273 +30,171 @@ fn main() -> Result<(), anyhow::Error> {
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
     let timer_service = EspTaskTimerService::new()?;
-    let nvs = EspDefaultNvsPartition::take()?;
-
-    let wifi = block_on_send(connect_wifi(
-        peripherals.modem,
-        sys_loop.clone(),
-        nvs,
-        timer_service,
-    ));
-
-    let ip_info = match &wifi {
-        Ok(wifi) => {
-            let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-            Some(ip_info)
-        }
-        Err(e) => {
-            warn!("Error connecting to wifi: {:?}", e);
-            None
-        }
-    };
-
-    info!("Wifi DHCP info: {:?}", ip_info);
 
     let pins = peripherals.pins;
 
+    let spi = peripherals.spi2;
+    let dc = PinDriver::output(pins.gpio40)?;
+    let sclk = pins.gpio36;
+    let sdo = pins.gpio35; // mosi
+    let sdi = pins.gpio37; // miso
+    let spi_rst = PinDriver::output(pins.gpio41)?;
+    let tft_cs = pins.gpio42;
+    let eth_cs = pins.gpio10;
+    let eth_int = pins.gpio13;
+    let eth_rst = pins.gpio12;
+
     info!("Starting ADC");
-    // let adc_config = adc::oneshot::config::AdcChannelConfig {
-    //     attenuation: adc::attenuation::DB_11,
-    //     ..Default::default()
-    // };
-    // let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
-    // let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio16, &adc_config)?;
-    let mut bpm_input = PinDriver::input(pins.gpio16)?;
-    bpm_input.set_pull(Pull::Down)?;
+    let adc_config = adc::oneshot::config::AdcChannelConfig {
+        attenuation: adc::attenuation::DB_11,
+        ..Default::default()
+    };
+    let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
+    let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio18, &adc_config)?;
 
     info!("ADC started");
 
-    // #################################### HAPTIC ###############################################
-    let haptic: Result<Drv2605<i2c::I2cDriver<'_>>, anyhow::Error> = (|| {
-        let i2c = peripherals.i2c0;
-        let sda = pins.gpio3;
-        let scl = pins.gpio4;
+    let mut samples = [0u8; 2 * 500];
 
-        let i2c_driver = i2c::I2cDriver::new(
-            i2c,
-            sda,
-            scl,
-            &i2c::config::Config::new().baudrate(400.kHz().into()),
-        )?;
+    let i2c = peripherals.i2c0;
+    let sda = pins.gpio3;
+    let scl = pins.gpio4;
 
-        let mut haptic = Drv2605::new(i2c_driver);
+    let i2c_driver = i2c::I2cDriver::new(
+        i2c,
+        sda,
+        scl,
+        &i2c::config::Config::new().baudrate(400.kHz().into()),
+    )?;
 
-        haptic.init_open_loop_erm()?;
-        haptic.set_single_effect(Effect::PulsingStrongOne100)?;
+    let mut tft_power = PinDriver::output(pins.gpio7)?;
+    let mut backlight = PinDriver::output(pins.gpio45)?;
 
-        Ok(haptic)
-    })();
+    info!("Pins initialized");
 
-    // #################################### DISPLAY ###############################################
-    let display: Result<mipidsi::Display<_, ST7789, _>, anyhow::Error> = (|| {
-        let spi = peripherals.spi2;
-        let dc = PinDriver::output(pins.gpio40)?;
-        let sclk = pins.gpio36;
-        let sdo = pins.gpio35; // mosi
-        let sdi = pins.gpio37; // miso
-        let tft_cs = pins.gpio42;
-        // let eth_cs = pins.gpio10;
-        let rst = PinDriver::output(pins.gpio41)?;
+    tft_power.set_high()?;
+    backlight.set_high()?;
 
-        let mut tft_power = PinDriver::output(pins.gpio7)?;
-        let mut backlight = PinDriver::output(pins.gpio45)?;
+    info!("Display power on");
 
-        tft_power.set_high()?;
-        backlight.set_high()?;
+    let mut haptic = Drv2605::new(i2c_driver);
 
-        info!("Display power on");
+    info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
 
-        let config = spi::config::Config::new()
-            .baudrate(26.MHz().into())
-            .data_mode(spi::config::MODE_3);
+    info!(
+        "Haptic driver effect set to: {:?}",
+        haptic.set_single_effect(Effect::PulsingStrongOne100)
+    );
 
-        let spi_driver = spi::SpiDriver::new(
-            spi,
-            sclk,
-            sdo,
-            Some(sdi),
-            &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(240 * 135 * 2 + 8)),
-        )?;
+    let config = spi::config::Config::new()
+        .baudrate(26.MHz().into())
+        .data_mode(spi::config::MODE_3);
 
-        let tft_spi_device = spi::SpiDeviceDriver::new(spi_driver, Some(tft_cs), &config)?;
+    let spi_driver = spi::SpiDriver::new(
+        spi,
+        sclk,
+        sdo,
+        Some(sdi),
+        &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(4096)),
+    )?;
 
-        info!("SPI initialized");
+    let tft_spi_device = spi::SpiDeviceDriver::new(&spi_driver, Some(tft_cs), &config)?;
 
-        let mut delay = delay::Ets;
+    info!("SPI initialized");
 
-        let di = SPIInterface::new(tft_spi_device, dc);
-        let mut display = Builder::new(ST7789, di)
-            .display_size(135, 240)
-            .orientation(Orientation::new().rotate(Rotation::Deg90))
-            .display_offset(52, 40)
-            .invert_colors(ColorInversion::Inverted)
-            .reset_pin(rst)
-            .init(&mut delay)
-            .map_err(|_| anyhow!("display init"))?;
+    let mut delay = delay::Ets;
 
-        info!("Display initialized");
+    let di = SPIInterface::new(tft_spi_device, dc);
+    let mut display = Builder::new(ST7789, di)
+        .display_size(135, 240)
+        .orientation(Orientation::new().rotate(Rotation::Deg90))
+        .display_offset(52, 40)
+        .invert_colors(ColorInversion::Inverted)
+        .reset_pin(spi_rst)
+        .init(&mut delay)
+        .map_err(|_| anyhow!("display init"))?;
 
-        display
-            .clear(Rgb565::RED)
-            .map_err(|_| anyhow!("clear display"))?;
+    info!("Display initialized");
 
-        info!("Display cleared");
+    display
+        .clear(Rgb565::RED)
+        .map_err(|_| anyhow!("clear display"))?;
 
-        // Create a text at position (20, 30) and draw it using the previously defined style.
-        Text::with_text_style(
-            "Test",
-            Point::new(100, 30),
-            CHARACTER_STYLE_WHITE,
-            TEXT_STYLE,
-        )
+    info!("Display cleared");
+
+    get_styled_text("Unconnected", 100, 50)
         .draw(&mut display)
         .map_err(|_| anyhow!("draw text"))?;
 
-        Ok(display)
-    })();
+    info!("Text drawn");
+
+    let mut eth = eth::EspEth::wrap(eth::EthDriver::new_spi(
+        &spi_driver,
+        eth_int,
+        Some(eth_cs),
+        Some(eth_rst),
+        eth::SpiEthChipset::W5500,
+        20_u32.MHz().into(),
+        Some(&[0x98, 0x76, 0xB6, 0x12, 0xF9, 0x93]),
+        None,
+        sys_loop.clone(),
+    )?)?;
+
+    let ip_info = esp_idf_svc::hal::task::block_on(async {
+        let mut eth = eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
+
+        info!("Starting eth...");
+
+        eth.start().await?;
+
+        info!("Waiting for DHCP lease...");
+
+        eth.wait_netif_up().await?;
+
+        let ip_info = eth.eth().netif().get_ip_info()?;
+
+        info!("Eth DHCP info: {:?}", ip_info);
+
+        Result::<_, EspError>::Ok(ip_info)
+    })?;
+
+    display
+        .clear(Rgb565::GREEN)
+        .map_err(|_| anyhow!("clear display"))?;
+
+    get_styled_text("Connected", 100, 50)
+        .draw(&mut display)
+        .map_err(|_| anyhow!("draw text"))?;
+
+    ping(ip_info.subnet.gateway)?;
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3333))?;
+    socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 45), 34254))?;
     info!("Socket bound to {:?}", socket.local_addr()?);
 
-    let mut status = Arc::new(Mutex::new(Status {
-        haptic: true, //haptic.is_ok(),
-        display: display.is_ok(),
-        network: wifi.is_ok(),
-        adc: true,
-        ip_info,
-        target_ip: None,
-        target_port: None,
-    }));
-
-    {
-        let status = status.clone();
-        thread::spawn(move || {
-            let socket =
-                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3334)).unwrap();
-
-            match socket.accept() {
-                Ok((mut stream, addr)) => {
-                    info!("Connection from: {:?}", addr);
-
-                    let mut buf = [0; 1024];
-                    loop {
-                        match stream.read(&mut buf) {
-                            Ok(0) => {
-                                info!("Connection closed");
-                                let mut status = status.lock().unwrap();
-                                status.target_ip = None;
-                                status.target_port = None;
-                                break;
-                            }
-                            Ok(n) => {
-                                let data = &buf[..n];
-                                let data = std::str::from_utf8(data).unwrap();
-                                info!("Received: {}", data);
-
-                                if let Ok(addr) = data.parse::<SocketAddrV4>() {
-                                    let mut status = status.lock().unwrap();
-                                    status.target_ip = Some(*addr.ip());
-                                    status.target_port = Some(addr.port());
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Error receiving data: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Error accepting connection: {:?}", e);
-                }
-            }
-        });
-    }
-
-    {
-        if !status.lock().unwrap().is_ok() {
-            error!("Not all systems are ready: {:?}", status);
-            return Err(anyhow!("Not all systems are ready"));
-        }
-    }
-
-    let mut haptic = haptic.unwrap();
-    let mut display = display.unwrap();
+    let mut i = 0;
 
     block_on(async {
         loop {
-            bpm_input.wait_for_high().await?;
+            timer.delay(timer.tick_hz() / 500).await?;
 
-            haptic.set_go(true)?;
+            samples[i..i + 2].copy_from_slice(&adc.read()?.to_be_bytes());
+            i += 2;
 
-            // if let Ok(status) = status.try_lock() {
-            //     if let Some(target_ip) = status.target_ip {
-            //         if let Some(target_port) = status.target_port {
-            //             let ip = target_ip;
-            //             let port = target_port;
-
-            //             match socket.send_to(&[1; 1], SocketAddrV4::new(ip, port)) {
-            //                 Ok(_) => (),
-            //                 Err(e) => {
-            //                     warn!("Error sending data: {:?}", e);
-            //                 }
-            //             };
-            //         }
-            //     }
-            // }
-
-            timer.delay(timer.tick_hz() / 10).await?;
-
-            haptic.set_go(false)?;
+            if i >= samples.len() {
+                i = 0;
+                match socket.send(&samples) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        warn!("Error sending data: {:?}", e);
+                        continue;
+                    }
+                }
+            }
         }
     })
-}
-
-fn block_on_send<F>(f: F) -> F::Output
-where
-    F: core::future::Future + Send + 'static, // These constraints are why this additional example exists in the first place
-{
-    block_on(f)
-}
-
-async fn connect_wifi<M>(
-    modem: M,
-    sys_loop: EspSystemEventLoop,
-    nvs: EspDefaultNvsPartition,
-    timer_service: EspTaskTimerService,
-) -> anyhow::Result<AsyncWifi<EspWifi<'static>>>
-where
-    M: WifiModemPeripheral + 'static,
-{
-    let mut wifi = AsyncWifi::wrap(
-        EspWifi::new(modem, sys_loop.clone(), Some(nvs))?,
-        sys_loop,
-        timer_service,
-    )?;
-
-    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: SSID.try_into().unwrap(),
-        bssid: None,
-        auth_method: AuthMethod::WPA2Personal,
-        password: PASSWORD.try_into().unwrap(),
-        channel: None,
-        ..Default::default()
-    });
-
-    wifi.set_configuration(&wifi_configuration)?;
-
-    wifi.start().await?;
-    info!("Wifi started");
-
-    wifi.connect().await?;
-    info!("Wifi connected");
-
-    wifi.wait_netif_up().await?;
-    info!("Wifi netif up");
-
-    Ok(wifi)
 }
 
 fn ping(ip: ipv4::Ipv4Addr) -> Result<(), anyhow::Error> {
@@ -335,16 +210,91 @@ fn ping(ip: ipv4::Ipv4Addr) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-const CHARACTER_STYLE_WHITE: MonoTextStyle<'_, Rgb565> =
-    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
+fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>> {
+    let character_style = MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::WHITE);
 
-const CHARACTER_STYLE_GREEN: MonoTextStyle<'_, Rgb565> =
-    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::GREEN);
+    // Create a new text style.
+    let text_style = TextStyleBuilder::new()
+        .alignment(Alignment::Center)
+        .line_height(LineHeight::Percent(150))
+        .build();
 
-const CHARACTER_STYLE_RED: MonoTextStyle<'_, Rgb565> =
-    MonoTextStyle::new(&ascii::FONT_10X20, Rgb565::RED);
+    // Create a text at position (20, 30) and draw it using the previously defined style.
+    Text::with_text_style(text, Point::new(x, y), character_style, text_style)
+}
 
-const TEXT_STYLE: TextStyle = TextStyleBuilder::new()
-    .alignment(Alignment::Center)
-    .line_height(LineHeight::Percent(150))
-    .build();
+// use esp_idf_svc::eth;
+// use esp_idf_svc::eventloop::EspSystemEventLoop;
+// use esp_idf_svc::hal::spi;
+// use esp_idf_svc::hal::{prelude::Peripherals, units::FromValueType};
+// use esp_idf_svc::log::EspLogger;
+// use esp_idf_svc::sys::EspError;
+// use esp_idf_svc::timer::EspTaskTimerService;
+// use esp_idf_svc::{ipv4, ping};
+
+// use log::{info, warn};
+
+// fn main() -> anyhow::Result<()> {
+//     esp_idf_svc::sys::link_patches();
+//     EspLogger::initialize_default();
+
+//     let peripherals = Peripherals::take()?;
+//     let pins = peripherals.pins;
+//     let sysloop = EspSystemEventLoop::take()?;
+//     let timer_service = EspTaskTimerService::new()?;
+
+//     let mut eth = eth::EspEth::wrap(eth::EthDriver::new_spi(
+//         spi::SpiDriver::new(
+//             peripherals.spi2,
+//             pins.gpio36,
+//             pins.gpio35,
+//             Some(pins.gpio37),
+//             &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(4096)),
+//         )?,
+//         pins.gpio13,
+//         Some(pins.gpio10),
+//         Some(pins.gpio12),
+//         // Replace with DM9051 or KSZ8851SNL if you have some of these variants
+//         eth::SpiEthChipset::W5500,
+//         20_u32.MHz().into(),
+//         Some(&[0x98, 0x76, 0xB6, 0x12, 0xF9, 0x93]),
+//         None,
+//         sysloop.clone(),
+//     )?)?;
+
+//     // Wait for the Eth peripheral and network layer 3 to come up - in an async way because we can
+//     let ip_info = esp_idf_svc::hal::task::block_on(async {
+//         let mut eth = eth::AsyncEth::wrap(&mut eth, sysloop.clone(), timer_service)?;
+
+//         info!("Starting eth...");
+
+//         eth.start().await?;
+
+//         info!("Waiting for DHCP lease...");
+
+//         eth.wait_netif_up().await?;
+
+//         let ip_info = eth.eth().netif().get_ip_info()?;
+
+//         info!("Eth DHCP info: {:?}", ip_info);
+
+//         Result::<_, EspError>::Ok(ip_info)
+//     })?;
+
+//     ping(ip_info.subnet.gateway)?;
+
+//     Ok(())
+// }
+
+// fn ping(ip: ipv4::Ipv4Addr) -> Result<(), EspError> {
+//     info!("About to do some pings for {:?}", ip);
+
+//     let ping_summary = ping::EspPing::default().ping(ip, &Default::default())?;
+//     if ping_summary.transmitted != ping_summary.received {
+//         warn!("Pinging IP {} resulted in timeouts", ip);
+//     }
+
+//     info!("Pinging done");
+
+//     Ok(())
+// }
