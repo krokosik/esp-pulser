@@ -43,7 +43,8 @@
         "ms-vscode.cpptools",
         "actboy168.tasks",
         "Wokwi.wokwi-vscode",
-        "ms-azuretools.vscode-docker"
+        "ms-azuretools.vscode-docker",
+        "eamodio.gitlens"
       ]
     }
   },
