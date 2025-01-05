@@ -1,4 +1,8 @@
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::io::Read;
+use std::net::TcpListener;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
@@ -6,8 +10,6 @@ use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::eth;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::ipv4;
-use esp_idf_svc::ping;
 use esp_idf_svc::sys::EspError;
 use esp_idf_svc::timer::EspTaskTimerService;
 use log::warn;
@@ -174,11 +176,59 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
-    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 3333))?;
-    socket.connect(SocketAddrV4::new(Ipv4Addr::new(192, 168, 0, 210), 34254))?;
-    info!("Socket bound to {:?}", socket.local_addr()?);
+    let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
+        Ipv4Addr::new(0, 0, 0, 0),
+        3333,
+    ))?));
+
+    {
+        let udp_socket = udp_socket.lock().unwrap();
+        info!("Socket bound to {:?}", udp_socket.local_addr()?);
+    }
 
     let mut i = 0;
+    {
+        let udp_socket = udp_socket.clone();
+        thread::spawn(move || {
+            let tcp_socket =
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
+
+            loop {
+                match tcp_socket.accept() {
+                    Ok((mut stream, addr)) => {
+                        info!("Connection from: {:?}", addr);
+
+                        let mut buf = [0; 10];
+                        loop {
+                            match stream.read(&mut buf) {
+                                Ok(0) => {
+                                    info!("Connection closed");
+                                    break;
+                                }
+                                Ok(2) => {
+                                    let port = u16::from_be_bytes([buf[0], buf[1]]);
+                                    let udp_target = SocketAddr::new(addr.ip(), port);
+                                    info!("Connecting to UDP socket at: {}", udp_target);
+                                    udp_socket.lock().unwrap().connect(udp_target).unwrap();
+                                }
+                                Ok(n) => {
+                                    info!("Received {} bytes", n);
+                                    info!("Data: {:?}", &buf[..n]);
+                                }
+                                Err(e) => {
+                                    warn!("Error receiving data: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Error accepting connection: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
 
     let mut pulse_sensor = pulse_sensor::PulseSensor::new();
 
@@ -206,7 +256,7 @@ fn main() -> Result<(), anyhow::Error> {
 
             if i >= samples.len() {
                 i = 0;
-                match socket.send(&samples) {
+                match udp_socket.lock().unwrap().send(&samples) {
                     Ok(_) => (),
                     Err(e) => {
                         warn!("Error sending data: {:?}", e);
@@ -216,19 +266,6 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
     })
-}
-
-fn ping(ip: ipv4::Ipv4Addr) -> Result<(), anyhow::Error> {
-    info!("About to do some pings for {:?}", ip);
-
-    let ping_summary = ping::EspPing::default().ping(ip, &Default::default())?;
-    if ping_summary.transmitted != ping_summary.received {
-        warn!("Pinging IP {} resulted in timeouts", ip);
-    }
-
-    info!("Pinging done");
-
-    Ok(())
 }
 
 fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>> {
