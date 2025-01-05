@@ -166,7 +166,7 @@ fn main() -> Result<(), anyhow::Error> {
         .clear(Rgb565::GREEN)
         .map_err(|_| anyhow!("clear display"))?;
 
-    get_styled_text("Connected", 100, 50)
+    get_styled_text(&["Connected", &ip_info.ip.to_string()].join("\n"), 100, 50)
         .draw(&mut display)
         .map_err(|_| anyhow!("draw text"))?;
 

@@ -142,7 +142,7 @@ impl PulseSensor {
 
         if self.n > 250 {
             // avoid high frequency noise
-            if self.signal > self.thresh && self.pulse == false && self.n > (self.ibi / 5) * 3 {
+            if self.signal > self.thresh && !self.pulse && self.n > (self.ibi / 5) * 3 {
                 self.pulse = true; // set the pulse flag when we think there is a pulse
                 self.ibi = self.n; // measure time between beats in mS
                 self.last_beat_time = self.sample_counter; // keep track of time for next pulse
