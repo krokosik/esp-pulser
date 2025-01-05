@@ -80,9 +80,9 @@ impl PulseSensor {
     }
 
     // Returns the sample most recently-read from this PulseSensor.
-    pub fn get_latest_sample(&self) -> u16 {
-        self.signal
-    }
+    // pub fn get_latest_sample(&self) -> u16 {
+    //     self.signal
+    // }
 
     // Returns the latest beats-per-minute measurement on this PulseSensor.
     pub fn get_beats_per_minute(&self) -> u16 {
@@ -101,15 +101,15 @@ impl PulseSensor {
         ret
     }
 
-    // Returns true if this PulseSensor signal is inside a beat vs. outside.
-    pub fn is_inside_beat(&self) -> bool {
-        self.pulse
-    }
+    // // Returns true if this PulseSensor signal is inside a beat vs. outside.
+    // pub fn is_inside_beat(&self) -> bool {
+    //     self.pulse
+    // }
 
-    // Returns the latest amp value.
-    pub fn get_pulse_amplitude(&self) -> u16 {
-        self.amp
-    }
+    // // Returns the latest amp value.
+    // pub fn get_pulse_amplitude(&self) -> u16 {
+    //     self.amp
+    // }
 
     // Returns the sample number of the most recent detected pulse.
     pub fn get_last_beat_time(&self) -> u32 {
@@ -186,23 +186,13 @@ impl PulseSensor {
 
         if self.n > 2500 {
             // if 2.5 seconds go by without a beat
-            self.thresh = self.thresh_setting; // reset the threshold
-            self.p = ESP32_ADC_RESOLUTION / 2; // reset the peak
-            self.t = ESP32_ADC_RESOLUTION / 2; // reset the trough
-            self.last_beat_time = self.sample_counter; // bring the last beat up to date
-            self.first_beat = true; // set the first beat flag so we can do a real IBI measurement
-            self.second_beat = false; // clear the second beat flag
-            self.qs = false; // reset the Quantified Self flag
-            self.bpm = 0; // reset the BPM to 0
-            self.ibi = 750; // reset the IBI to 750
-            self.pulse = false; // reset the pulse flag
-            self.amp = ESP32_ADC_RESOLUTION / 10; // reset the amplitude
+            self.reset_variables();
         }
     }
 
     // (internal to the library) Update the thresh variables.
-    fn set_threshold(&mut self, threshold: u16) {
-        self.thresh_setting = threshold;
-        self.thresh = threshold;
-    }
+    // fn set_threshold(&mut self, threshold: u16) {
+    //     self.thresh_setting = threshold;
+    //     self.thresh = threshold;
+    // }
 }
