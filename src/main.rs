@@ -60,7 +60,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     info!("ADC started");
 
-    let mut samples = [0u8; 2 * 100];
+    let mut samples = [0u8; 2 * 100 + 4];
 
     let i2c = peripherals.i2c0;
     let sda = pins.gpio3;
@@ -186,7 +186,7 @@ fn main() -> Result<(), anyhow::Error> {
         info!("Socket bound to {:?}", udp_socket.local_addr()?);
     }
 
-    let mut i = 0;
+    let mut i = 4;
     {
         let udp_socket = udp_socket.clone();
         thread::spawn(move || {
@@ -255,7 +255,10 @@ fn main() -> Result<(), anyhow::Error> {
             i += 2;
 
             if i >= samples.len() {
-                i = 0;
+                i = 4;
+                samples[0..2].copy_from_slice(&pulse_sensor.get_beats_per_minute().to_be_bytes());
+                samples[2..4]
+                    .copy_from_slice(&pulse_sensor.get_inter_beat_interval_ms().to_be_bytes());
                 match udp_socket.lock().unwrap().send(&samples) {
                     Ok(_) => (),
                     Err(e) => {
