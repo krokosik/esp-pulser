@@ -4,20 +4,27 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 use display_interface_spi::SPIInterface;
 use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
+use embedded_svc::http::client::Client;
+use embedded_svc::http::Headers;
 use esp_idf_svc::eth;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::sys::EspError;
-use esp_idf_svc::timer::EspTaskTimerService;
-use log::warn;
-use mipidsi::{models::ST7789, options::*, Builder};
-
+use esp_idf_svc::hal::reset::restart;
 use esp_idf_svc::hal::{
     adc, delay, gpio::*, i2c, prelude::*, spi, task::*, timer::*, units::FromValueType,
 };
+use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
+use esp_idf_svc::http::Method;
+use esp_idf_svc::ota::{EspFirmwareInfoLoader, EspOta, FirmwareInfo};
+use esp_idf_svc::sys::{EspError, ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
+use esp_idf_svc::timer::EspTaskTimerService;
+use http::header::ACCEPT;
+use http::Uri;
+use log::warn;
+use mipidsi::{models::ST7789, options::*, Builder};
 
 use log::info;
 
@@ -26,6 +33,9 @@ mod pulse_sensor;
 const SAMPLING_RATE_HZ: u64 = 500;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const UPDATE_BIN_URL: &str =
+    "https://github.com/krokosik/esp-pulser/releases/download/vTAG/esp-pulser";
 
 #[derive(Debug, serde::Serialize)]
 struct Status {
@@ -52,7 +62,7 @@ impl Status {
     }
 }
 
-fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
@@ -226,7 +236,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut i = 4;
     {
         let udp_socket = udp_socket.clone();
-        thread::spawn(move || {
+        thread::Builder::new().stack_size(8 * 1024).spawn(move || {
             let tcp_socket =
                 TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
 
@@ -249,8 +259,28 @@ fn main() -> Result<(), anyhow::Error> {
                                     udp_socket.lock().unwrap().connect(udp_target).unwrap();
                                 }
                                 Ok(n) => {
-                                    info!("Received {} bytes", n);
-                                    info!("Data: {:?}", &buf[..n]);
+                                    info!("Received TCP command: {:?}", buf[0]);
+                                    match buf[0] {
+                                        0 => {
+                                            info!("Restarting...");
+                                            restart();
+                                        }
+                                        1 => {
+                                            info!("Attempting update...");
+                                            let data =
+                                                String::from_utf8(buf[1..n].to_vec()).unwrap();
+                                            let update_url = UPDATE_BIN_URL.replace("TAG", &data);
+                                            if let Ok(u) = Uri::try_from(update_url) {
+                                                simple_download_and_update_firmware(u).unwrap();
+                                            } else {
+                                                log::warn!("Invalid URL to download firmware");
+                                            }
+                                            restart();
+                                        }
+                                        _ => {
+                                            info!("Unknown command");
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     warn!("Error receiving data: {:?}", e);
@@ -264,7 +294,7 @@ fn main() -> Result<(), anyhow::Error> {
                     }
                 }
             }
-        });
+        })?;
     }
 
     let status = Arc::new(Mutex::new(status));
@@ -277,7 +307,7 @@ fn main() -> Result<(), anyhow::Error> {
             let status = status.lock().unwrap();
             let status_bytes = bincode::serialize(&*status).unwrap();
             match udp_socket.lock().unwrap().send(&status_bytes) {
-                Ok(_) => info!("Status sent"),
+                Ok(_) => {}
                 Err(e) => warn!("Error sending status: {:?}", e),
             }
             // let status_text = format!(
@@ -356,4 +386,82 @@ fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>
 
     // Create a text at position (20, 30) and draw it using the previously defined style.
     Text::with_text_style(text, Point::new(x, y), character_style, text_style)
+}
+
+const FIRMWARE_DOWNLOAD_CHUNK_SIZE: usize = 1024 * 20;
+// Not expect firmware bigger than partition size
+const FIRMWARE_MAX_SIZE: usize = 1_310_720;
+const FIRMWARE_MIN_SIZE: usize = size_of::<FirmwareInfo>() + 1024;
+
+pub fn simple_download_and_update_firmware(url: Uri) -> Result<()> {
+    let mut client = Client::wrap(EspHttpConnection::new(&Configuration {
+        buffer_size: Some(1024 * 6),
+        buffer_size_tx: Some(1024),
+        use_global_ca_store: true,
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    })?);
+    let headers = [(ACCEPT.as_str(), mime::APPLICATION_OCTET_STREAM.as_ref())];
+    let surl = url.to_string();
+    let request = client
+        .request(Method::Get, &surl, &headers)
+        .map_err(|e| e.0)?;
+    let mut response = request.submit().map_err(|e| e.0)?;
+    if response.status() != 200 {
+        log::info!("Bad HTTP response: {}", response.status());
+        return Err(anyhow!(ESP_ERR_INVALID_RESPONSE));
+    }
+    let file_size = response.content_len().unwrap_or(0) as usize;
+    if file_size <= FIRMWARE_MIN_SIZE {
+        log::info!(
+            "File size is {file_size}, too small to be a firmware! No need to proceed further."
+        );
+        return Err(anyhow!(ESP_ERR_IMAGE_INVALID));
+    }
+    if file_size > FIRMWARE_MAX_SIZE {
+        log::info!("File is too big ({file_size} bytes).");
+        return Err(anyhow!(ESP_ERR_IMAGE_INVALID));
+    }
+    let mut ota = EspOta::new()?;
+    let mut work = ota.initiate_update()?;
+    let mut buff = vec![0; FIRMWARE_DOWNLOAD_CHUNK_SIZE];
+    let mut total_read_len: usize = 0;
+    let mut got_info = false;
+    let dl_result = loop {
+        let n = response.read(&mut buff).unwrap_or_default();
+        total_read_len += n;
+        if !got_info {
+            match get_firmware_info(&buff[..n]) {
+                Ok(info) => log::info!("Firmware to be downloaded: {info:?}"),
+                Err(e) => {
+                    log::error!("Failed to get firmware info from downloaded bytes!");
+                    break Err(e);
+                }
+            };
+            got_info = true;
+        }
+        if n > 0 {
+            if let Err(e) = work.write(&buff[..n]) {
+                log::error!("Failed to write to OTA. {e}");
+                break Err(anyhow!(e));
+            }
+        }
+        if total_read_len >= file_size {
+            break Ok(());
+        }
+    };
+    if dl_result.is_err() {
+        return work.abort().map_err(|e| anyhow!(e));
+    }
+    if total_read_len < file_size {
+        log::error!("Supposed to download {file_size} bytes, but we could only get {total_read_len}. May be network error?");
+        return work.abort().map_err(|e| anyhow!(e));
+    }
+    work.complete().map_err(|e| anyhow!(e))
+}
+
+fn get_firmware_info(buff: &[u8]) -> Result<FirmwareInfo> {
+    let mut loader = EspFirmwareInfoLoader::new();
+    loader.load(buff)?;
+    loader.get_info().map_err(|e| anyhow!(e))
 }

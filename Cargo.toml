@@ -1,6 +1,6 @@
 [package]
 name = "esp-pulser"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["krokosik <wikkra@gmail.com>"]
 edition = "2021"
 resolver = "2"
@@ -33,6 +33,8 @@ anyhow = "1.0.95"
 drv2605 = "0.1.0"
 bincode = "1.3.3"
 serde = { version = "1.0.217", features = ["derive"] }
+mime = "0.3.17"
+http = "1.2.0"
 
 [build-dependencies]
 embuild = "0.33.0"
