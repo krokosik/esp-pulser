@@ -25,6 +25,33 @@ mod pulse_sensor;
 
 const SAMPLING_RATE_HZ: u64 = 500;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, serde::Serialize)]
+struct Status {
+    version: [u8; 3],
+    connected: bool,
+    display_ok: bool,
+    haptic_ok: bool,
+    heart_ok: bool,
+}
+
+impl Status {
+    fn new() -> Self {
+        let mut version = [0; 3];
+        for (i, v) in VERSION.split('.').take(3).enumerate() {
+            version[i] = v.parse().unwrap_or(0);
+        }
+        Self {
+            version,
+            connected: false,
+            display_ok: false,
+            haptic_ok: false,
+            heart_ok: false,
+        }
+    }
+}
+
 fn main() -> Result<(), anyhow::Error> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -32,6 +59,8 @@ fn main() -> Result<(), anyhow::Error> {
 
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    let mut status = Status::new();
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -57,6 +86,8 @@ fn main() -> Result<(), anyhow::Error> {
     };
     let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
     let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio18, &adc_config)?;
+
+    status.heart_ok = true;
 
     info!("ADC started");
 
@@ -92,6 +123,8 @@ fn main() -> Result<(), anyhow::Error> {
         haptic.set_single_effect(Effect::PulsingStrongOne100)
     );
 
+    status.haptic_ok = true;
+
     let config = spi::config::Config::new()
         .baudrate(26.MHz().into())
         .data_mode(spi::config::MODE_3);
@@ -121,6 +154,8 @@ fn main() -> Result<(), anyhow::Error> {
         .map_err(|_| anyhow!("display init"))?;
 
     info!("Display initialized");
+
+    status.display_ok = true;
 
     display
         .clear(Rgb565::RED)
@@ -163,6 +198,8 @@ fn main() -> Result<(), anyhow::Error> {
 
         Result::<_, EspError>::Ok(ip_info)
     })?;
+
+    status.connected = true;
 
     display
         .clear(Rgb565::GREEN)
@@ -230,6 +267,43 @@ fn main() -> Result<(), anyhow::Error> {
         });
     }
 
+    let status = Arc::new(Mutex::new(status));
+
+    {
+        let udp_socket = udp_socket.clone();
+        let status = status.clone();
+        thread::spawn(move || loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let status = status.lock().unwrap();
+            let status_bytes = bincode::serialize(&*status).unwrap();
+            match udp_socket.lock().unwrap().send(&status_bytes) {
+                Ok(_) => info!("Status sent"),
+                Err(e) => warn!("Error sending status: {:?}", e),
+            }
+            // let status_text = format!(
+            //     "Version: {}.{}.{}\nConnected: {}\nIP: {}\nDisplay OK: {}\nHaptic OK: {}\nHeart OK: {}",
+            //     status.version[0],
+            //     status.version[1],
+            //     status.version[2],
+            //     status.connected,
+            //     ip_info.ip,
+            //     status.display_ok,
+            //     status.haptic_ok,
+            //     status.heart_ok
+            // );
+
+            // display
+            //     .clear(Rgb565::BLACK)
+            //     .map_err(|_| anyhow!("clear display"))
+            //     .unwrap();
+
+            // get_styled_text(&status_text, 100, 0)
+            //     .draw(&mut display)
+            //     .map_err(|_| anyhow!("draw text"))
+            //     .unwrap();
+        });
+    }
+
     let mut pulse_sensor = pulse_sensor::PulseSensor::new();
 
     block_on(async {
@@ -277,7 +351,7 @@ fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>
     // Create a new text style.
     let text_style = TextStyleBuilder::new()
         .alignment(Alignment::Center)
-        .line_height(LineHeight::Percent(150))
+        .line_height(LineHeight::Percent(100))
         .build();
 
     // Create a text at position (20, 30) and draw it using the previously defined style.
