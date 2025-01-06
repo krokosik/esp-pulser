@@ -8,8 +8,8 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
-  rust-checks:
-    name: Rust Checks
+  publish:
+    name: Publish
     runs-on: ubuntu-latest
     
     steps:
@@ -24,7 +24,7 @@ jobs:
           ldproxy: true
 
       - name: Install espflash
-        run: cargo install cargo-espflash
+        run: sudo apt install libudev-dev && cargo install cargo-espflash
 
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
