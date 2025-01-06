@@ -1,10 +1,6 @@
-name: Continuous Integration
+name: Publish
 
 on:
-  push:
-    paths-ignore:
-      - "**/README.md"
-  pull_request:
   workflow_dispatch:
 
 env:
@@ -15,26 +11,26 @@ jobs:
   rust-checks:
     name: Rust Checks
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        action:
-          - command: build
-            args: --release
-          - command: fmt
-            args: --all -- --check --color always
-          - command: clippy
-            args: --all-targets --all-features --workspace -- -D warnings
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Setup Rust
         uses: esp-rs/xtensa-toolchain@v1.5
         with:
           default: true
           buildtargets: esp32s3
           ldproxy: true
+
+      - name: Install espflash
+        run: cargo install cargo-espflash
+
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
-      - name: Run command
-        run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Trim binary
+        run: cargo espflash save-image --chip esp32s3 -s 4mb target/xtensa-esp32s3-espidf/release/esp-pulser
