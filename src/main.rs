@@ -10,24 +10,26 @@ use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use embedded_svc::http::client::Client;
 use embedded_svc::http::Headers;
-use esp_idf_svc::eth;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::reset::restart;
+use http::{header::ACCEPT, Uri};
+use mipidsi::{models::ST7789, options::*, Builder};
+
 use esp_idf_svc::hal::{
-    adc, delay, gpio::*, i2c, prelude::*, spi, task::*, timer::*, units::FromValueType,
+    adc, delay,
+    gpio::PinDriver,
+    i2c,
+    prelude::*,
+    reset::restart,
+    spi,
+    task::block_on,
+    timer::{TimerConfig, TimerDriver},
+    units::FromValueType,
 };
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::ota::{EspFirmwareInfoLoader, EspOta, FirmwareInfo};
 use esp_idf_svc::sys::{EspError, ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
-use esp_idf_svc::timer::EspTaskTimerService;
-use http::header::ACCEPT;
-use http::Uri;
-use log::warn;
-use mipidsi::{models::ST7789, options::*, Builder};
 
-use log::info;
-
+use esp_pulser::*;
 mod pulse_sensor;
 
 const SAMPLING_RATE_HZ: u64 = 500;
@@ -73,97 +75,49 @@ fn main() -> Result<()> {
     let mut status = Status::new();
 
     let peripherals = Peripherals::take()?;
-    let sys_loop = EspSystemEventLoop::take()?;
-    let timer_service = EspTaskTimerService::new()?;
-
     let pins = peripherals.pins;
+    let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
+    let timer_service = esp_idf_svc::timer::EspTaskTimerService::new()?;
 
-    let spi = peripherals.spi2;
-    let dc = PinDriver::output(pins.gpio40)?;
-    let sclk = pins.gpio36;
-    let sdo = pins.gpio35; // mosi
-    let sdi = pins.gpio37; // miso
-    let spi_rst = PinDriver::output(pins.gpio41)?;
-    let tft_cs = pins.gpio42;
-    let eth_cs = pins.gpio10;
-    let eth_int = pins.gpio13;
-    let eth_rst = pins.gpio12;
-
-    info!("Starting ADC");
-    let adc_config = adc::oneshot::config::AdcChannelConfig {
-        attenuation: adc::attenuation::DB_11,
-        ..Default::default()
-    };
-    let adc_driver = adc::oneshot::AdcDriver::new(peripherals.adc2)?;
-    let mut adc = adc::oneshot::AdcChannelDriver::new(adc_driver, pins.gpio18, &adc_config)?;
+    log::info!("Starting ADC");
+    let mut adc = adc_init!(peripherals.adc2, pins.gpio18)?;
 
     status.heart_ok = true;
 
-    info!("ADC started");
+    log::info!("ADC started");
 
     let mut samples = [0u8; 2 * 100 + 4];
 
-    let i2c = peripherals.i2c0;
-    let sda = pins.gpio3;
-    let scl = pins.gpio4;
-
-    let i2c_driver = i2c::I2cDriver::new(
-        i2c,
-        sda,
-        scl,
-        &i2c::config::Config::new().baudrate(400.kHz().into()),
-    )?;
+    let i2c_driver = i2c_init!(peripherals.i2c0, pins.gpio3, pins.gpio4)?;
 
     let mut tft_power = PinDriver::output(pins.gpio7)?;
     let mut backlight = PinDriver::output(pins.gpio45)?;
 
-    info!("Pins initialized");
+    log::info!("Pins initialized");
 
     tft_power.set_high()?;
     backlight.set_high()?;
 
-    info!("Display power on");
+    log::info!("Display power on");
 
     let mut haptic = Drv2605::new(i2c_driver);
 
-    info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
+    log::info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
 
-    info!(
+    log::info!(
         "Haptic driver effect set to: {:?}",
         haptic.set_single_effect(Effect::PulsingStrongOne100)
     );
 
     status.haptic_ok = true;
 
-    let config = spi::config::Config::new()
-        .baudrate(26.MHz().into())
-        .data_mode(spi::config::MODE_3);
+    let spi_driver = spi_init!(peripherals.spi2, pins.gpio36, pins.gpio35, pins.gpio37)?;
 
-    let spi_driver = spi::SpiDriver::new(
-        spi,
-        sclk,
-        sdo,
-        Some(sdi),
-        &spi::SpiDriverConfig::new().dma(spi::Dma::Auto(4096)),
-    )?;
+    log::info!("SPI initialized");
 
-    let tft_spi_device = spi::SpiDeviceDriver::new(&spi_driver, Some(tft_cs), &config)?;
+    let mut display = display_init!(&spi_driver, pins.gpio42, pins.gpio40, pins.gpio41)?;
 
-    info!("SPI initialized");
-
-    let mut delay = delay::Ets;
-
-    let di = SPIInterface::new(tft_spi_device, dc);
-    let mut display = Builder::new(ST7789, di)
-        .display_size(135, 240)
-        .orientation(Orientation::new().rotate(Rotation::Deg90))
-        .display_offset(52, 40)
-        .invert_colors(ColorInversion::Inverted)
-        .reset_pin(spi_rst)
-        .init(&mut delay)
-        .map_err(|_| anyhow!("display init"))?;
-
-    info!("Display initialized");
+    log::info!("Display initialized");
 
     status.display_ok = true;
 
@@ -171,40 +125,30 @@ fn main() -> Result<()> {
         .clear(Rgb565::RED)
         .map_err(|_| anyhow!("clear display"))?;
 
-    info!("Display cleared");
+    log::info!("Display cleared");
 
     get_styled_text("Unconnected", 100, 50)
         .draw(&mut display)
         .map_err(|_| anyhow!("draw text"))?;
 
-    info!("Text drawn");
+    log::info!("Text drawn");
 
-    let mut eth = eth::EspEth::wrap(eth::EthDriver::new_spi(
-        &spi_driver,
-        eth_int,
-        Some(eth_cs),
-        Some(eth_rst),
-        eth::SpiEthChipset::W5500,
-        20_u32.MHz().into(),
-        Some(&[0x98, 0x76, 0xB6, 0x12, 0xF9, 0x93]),
-        None,
-        sys_loop.clone(),
-    )?)?;
+    let mut eth = eth_init!(&spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop)?;
 
-    let ip_info = esp_idf_svc::hal::task::block_on(async {
-        let mut eth = eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
+    let ip_info = block_on(async {
+        let mut eth = esp_idf_svc::eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
 
-        info!("Starting eth...");
+        log::info!("Starting eth...");
 
         eth.start().await?;
 
-        info!("Waiting for DHCP lease...");
+        log::info!("Waiting for DHCP lease...");
 
         eth.wait_netif_up().await?;
 
         let ip_info = eth.eth().netif().get_ip_info()?;
 
-        info!("Eth DHCP info: {:?}", ip_info);
+        log::info!("Eth DHCP info: {:?}", ip_info);
 
         Result::<_, EspError>::Ok(ip_info)
     })?;
@@ -219,8 +163,6 @@ fn main() -> Result<()> {
         .draw(&mut display)
         .map_err(|_| anyhow!("draw text"))?;
 
-    // ping(ip_info.subnet.gateway)?;
-
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
@@ -230,7 +172,7 @@ fn main() -> Result<()> {
 
     {
         let udp_socket = udp_socket.lock().unwrap();
-        info!("Socket bound to {:?}", udp_socket.local_addr()?);
+        log::info!("Socket bound to {:?}", udp_socket.local_addr()?);
     }
 
     let mut i = 4;
@@ -243,30 +185,30 @@ fn main() -> Result<()> {
             loop {
                 match tcp_socket.accept() {
                     Ok((mut stream, addr)) => {
-                        info!("Connection from: {:?}", addr);
+                        log::info!("Connection from: {:?}", addr);
 
                         let mut buf = [0; 10];
                         loop {
                             match stream.read(&mut buf) {
                                 Ok(0) => {
-                                    info!("Connection closed");
+                                    log::info!("Connection closed");
                                     break;
                                 }
                                 Ok(2) => {
                                     let port = u16::from_be_bytes([buf[0], buf[1]]);
                                     let udp_target = SocketAddr::new(addr.ip(), port);
-                                    info!("Connecting to UDP socket at: {}", udp_target);
+                                    log::info!("Connecting to UDP socket at: {}", udp_target);
                                     udp_socket.lock().unwrap().connect(udp_target).unwrap();
                                 }
                                 Ok(n) => {
-                                    info!("Received TCP command: {:?}", buf[0]);
+                                    log::info!("Received TCP command: {:?}", buf[0]);
                                     match buf[0] {
                                         0 => {
-                                            info!("Restarting...");
+                                            log::info!("Restarting...");
                                             restart();
                                         }
                                         1 => {
-                                            info!("Attempting update...");
+                                            log::info!("Attempting update...");
                                             let data =
                                                 String::from_utf8(buf[1..n].to_vec()).unwrap();
                                             let update_url = UPDATE_BIN_URL.replace("TAG", &data);
@@ -278,19 +220,19 @@ fn main() -> Result<()> {
                                             restart();
                                         }
                                         _ => {
-                                            info!("Unknown command");
+                                            log::info!("Unknown command");
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Error receiving data: {:?}", e);
+                                    log::warn!("Error receiving data: {:?}", e);
                                     break;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Error accepting connection: {:?}", e);
+                        log::warn!("Error accepting connection: {:?}", e);
                     }
                 }
             }
@@ -308,7 +250,7 @@ fn main() -> Result<()> {
             let status_bytes = bincode::serialize(&*status).unwrap();
             match udp_socket.lock().unwrap().send(&status_bytes) {
                 Ok(_) => {}
-                Err(e) => warn!("Error sending status: {:?}", e),
+                Err(e) => log::warn!("Error sending status: {:?}", e),
             }
             // let status_text = format!(
             //     "Version: {}.{}.{}\nConnected: {}\nIP: {}\nDisplay OK: {}\nHaptic OK: {}\nHeart OK: {}",
@@ -349,9 +291,11 @@ fn main() -> Result<()> {
                 let ibi = pulse_sensor.get_inter_beat_interval_ms();
                 let last_beat_time = pulse_sensor.get_last_beat_time();
                 haptic.set_go(true)?;
-                info!(
+                log::info!(
                     "BPM: {}, IBI: {}, Last Beat Time: {}",
-                    bpm, ibi, last_beat_time
+                    bpm,
+                    ibi,
+                    last_beat_time
                 );
             }
 
@@ -366,7 +310,7 @@ fn main() -> Result<()> {
                 match udp_socket.lock().unwrap().send(&samples) {
                     Ok(_) => (),
                     Err(e) => {
-                        warn!("Error sending data: {:?}", e);
+                        log::warn!("Error sending data: {:?}", e);
                         continue;
                     }
                 }
