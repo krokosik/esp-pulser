@@ -57,25 +57,35 @@ macro_rules! eth_init {
 #[macro_export]
 macro_rules! display_init {
     ($spi_driver:expr, $tft_cs_pin:expr, $dc_pin:expr, $tft_rst_pin:expr) => {{
-        Builder::new(
-            ST7789,
-            SPIInterface::new(
-                spi::SpiDeviceDriver::new(
-                    $spi_driver,
-                    Some($tft_cs_pin),
-                    &spi::config::Config::new()
-                        .baudrate(26.MHz().into())
-                        .data_mode(spi::config::MODE_3),
-                )?,
-                PinDriver::output($dc_pin)?,
-            ),
-        )
-        .display_size(135, 240)
-        .orientation(Orientation::new().rotate(Rotation::Deg90))
-        .display_offset(52, 40)
-        .invert_colors(ColorInversion::Inverted)
-        .reset_pin(PinDriver::output($tft_rst_pin)?)
-        .init(&mut delay::Ets)
-        .map_err(|_| anyhow!("Failed to initialize display"))
+        let dc = PinDriver::output($dc_pin);
+        if let Err(e) = dc {
+            return Err(anyhow!(e));
+        }
+        let dc = dc.unwrap();
+        let rst = PinDriver::output($tft_rst_pin);
+        if let Err(e) = rst {
+            return Err(anyhow!(e));
+        }
+        let rst = rst.unwrap();
+
+        let spi_device = spi::SpiDeviceDriver::new(
+            $spi_driver,
+            Some($tft_cs_pin),
+            &spi::config::Config::new()
+                .baudrate(26.MHz().into())
+                .data_mode(spi::config::MODE_3),
+        );
+        if let Err(e) = spi_device {
+            return Err(anyhow!(e));
+        }
+        let spi_device = spi_device.unwrap();
+        Builder::new(ST7789, SPIInterface::new(spi_device, dc))
+            .display_size(135, 240)
+            .orientation(Orientation::new().rotate(Rotation::Deg90))
+            .display_offset(52, 40)
+            .invert_colors(ColorInversion::Inverted)
+            .reset_pin(rst)
+            .init(&mut delay::Ets)
+            .map_err(|_| anyhow!("Failed to initialize display"))
     }};
 }

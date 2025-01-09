@@ -48,6 +48,26 @@ struct Status {
     heart_ok: bool,
 }
 
+// struct UdpLogger {
+//     tx: std::sync::mpsc::Sender<String>,
+// }
+
+// impl log::Log for UdpLogger {
+//     fn enabled(&self, metadata: &log::Metadata) -> bool {
+//         metadata.level() <= log::Level::Info
+//     }
+
+//     fn log(&self, record: &log::Record) {
+//         if self.enabled(record.metadata()) {
+//             self.tx
+//                 .send(format!("{} - {}", record.level(), record.args()))
+//                 .unwrap();
+//         }
+//     }
+
+//     fn flush(&self) {}
+// }
+
 impl Status {
     fn new() -> Self {
         let mut version = [0; 3];
@@ -79,6 +99,52 @@ fn main() -> Result<()> {
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
     let timer_service = esp_idf_svc::timer::EspTaskTimerService::new()?;
 
+    let mut i2c_power = PinDriver::output(pins.gpio7)?;
+    i2c_power.set_high()?;
+
+    let spi_driver = spi_init!(peripherals.spi2, pins.gpio36, pins.gpio35, pins.gpio37)?;
+
+    let eth = eth_init!(&spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop);
+
+    let eth_ip_info = match eth {
+        Ok(mut eth) => block_on(async {
+            let mut eth_async =
+                esp_idf_svc::eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
+
+            log::info!("Starting eth...");
+
+            eth_async.start().await?;
+
+            log::info!("Waiting for DHCP lease...");
+
+            eth_async.wait_netif_up().await?;
+
+            let ip_info = eth_async.eth().netif().get_ip_info()?;
+
+            log::info!("Eth DHCP info: {:?}", ip_info);
+
+            Result::<_, EspError>::Ok((eth, ip_info))
+        }),
+        Err(e) => {
+            log::warn!("Failed to initialize eth: {:?}", e);
+            Err(e)
+        }
+    };
+
+    status.connected = eth_ip_info.is_ok();
+
+    let (_eth, ip_info) = match eth_ip_info {
+        Ok((eth, ip_info)) => (Some(eth), Some(ip_info)),
+        Err(_) => (None, None),
+    };
+
+    // if status.connected {
+    //     let (tx, rx) = std::sync::mpsc::channel::<String>();
+    //     let logger: UdpLogger = UdpLogger { tx };
+    //     log::set_boxed_logger(Box::new(logger)).unwrap();
+    //     log::set_max_level(log::LevelFilter::Info);
+    // }
+
     log::info!("Starting ADC");
     let mut adc = adc_init!(peripherals.adc2, pins.gpio18)?;
 
@@ -88,17 +154,11 @@ fn main() -> Result<()> {
 
     let mut samples = [0u8; 2 * 100 + 4];
 
-    let i2c_driver = i2c_init!(peripherals.i2c0, pins.gpio3, pins.gpio4)?;
-
-    let mut tft_power = PinDriver::output(pins.gpio7)?;
     let mut backlight = PinDriver::output(pins.gpio45)?;
+    let mut d1_button = PinDriver::input(pins.gpio1)?;
+    d1_button.set_pull(esp_idf_svc::hal::gpio::Pull::Down)?;
 
-    log::info!("Pins initialized");
-
-    tft_power.set_high()?;
-    backlight.set_high()?;
-
-    log::info!("Display power on");
+    let i2c_driver = i2c_init!(peripherals.i2c0, pins.gpio3, pins.gpio4)?;
 
     let mut haptic = Drv2605::new(i2c_driver);
 
@@ -110,58 +170,6 @@ fn main() -> Result<()> {
     );
 
     status.haptic_ok = true;
-
-    let spi_driver = spi_init!(peripherals.spi2, pins.gpio36, pins.gpio35, pins.gpio37)?;
-
-    log::info!("SPI initialized");
-
-    let mut display = display_init!(&spi_driver, pins.gpio42, pins.gpio40, pins.gpio41)?;
-
-    log::info!("Display initialized");
-
-    status.display_ok = true;
-
-    display
-        .clear(Rgb565::RED)
-        .map_err(|_| anyhow!("clear display"))?;
-
-    log::info!("Display cleared");
-
-    get_styled_text("Unconnected", 100, 50)
-        .draw(&mut display)
-        .map_err(|_| anyhow!("draw text"))?;
-
-    log::info!("Text drawn");
-
-    let mut eth = eth_init!(&spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop)?;
-
-    let ip_info = block_on(async {
-        let mut eth = esp_idf_svc::eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
-
-        log::info!("Starting eth...");
-
-        eth.start().await?;
-
-        log::info!("Waiting for DHCP lease...");
-
-        eth.wait_netif_up().await?;
-
-        let ip_info = eth.eth().netif().get_ip_info()?;
-
-        log::info!("Eth DHCP info: {:?}", ip_info);
-
-        Result::<_, EspError>::Ok(ip_info)
-    })?;
-
-    status.connected = true;
-
-    display
-        .clear(Rgb565::GREEN)
-        .map_err(|_| anyhow!("clear display"))?;
-
-    get_styled_text(&["Connected", &ip_info.ip.to_string()].join("\n"), 100, 50)
-        .draw(&mut display)
-        .map_err(|_| anyhow!("draw text"))?;
 
     let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
 
@@ -175,12 +183,13 @@ fn main() -> Result<()> {
         log::info!("Socket bound to {:?}", udp_socket.local_addr()?);
     }
 
-    let mut i = 4;
-    {
+    if status.connected {
         let udp_socket = udp_socket.clone();
         thread::Builder::new().stack_size(8 * 1024).spawn(move || {
             let tcp_socket =
                 TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
+
+            log::info!("Listening for GUI client...");
 
             loop {
                 match tcp_socket.accept() {
@@ -239,11 +248,52 @@ fn main() -> Result<()> {
         })?;
     }
 
-    let status = Arc::new(Mutex::new(status));
+    thread::spawn(move || {
+        block_on(async {
+            loop {
+                d1_button.wait_for_high().await.unwrap();
+                backlight.set_high().unwrap();
+                d1_button.wait_for_low().await.unwrap();
+                backlight.set_low().unwrap();
+            }
+        })
+    });
+
+    let display = display_init!(&spi_driver, pins.gpio42, pins.gpio40, pins.gpio41);
+
+    status.display_ok = display.is_ok();
+
+    if display.is_ok() {
+        let mut display = display.unwrap();
+        if ip_info.is_none() {
+            display
+                .clear(Rgb565::RED)
+                .map_err(|_| anyhow!("clear display"))?;
+
+            get_styled_text("Unconnected", 100, 50)
+                .draw(&mut display)
+                .map_err(|_| anyhow!("draw text"))?;
+        } else {
+            display
+                .clear(Rgb565::GREEN)
+                .map_err(|_| anyhow!("clear display"))?;
+
+            get_styled_text(
+                &["Connected", &ip_info.unwrap().ip.to_string()].join("\n"),
+                100,
+                50,
+            )
+            .draw(&mut display)
+            .map_err(|_| anyhow!("draw text"))?;
+        }
+    }
+
+    let status: Arc<Mutex<Status>> = Arc::new(Mutex::new(status));
 
     {
         let udp_socket = udp_socket.clone();
         let status = status.clone();
+
         thread::spawn(move || loop {
             thread::sleep(std::time::Duration::from_secs(1));
             let status = status.lock().unwrap();
@@ -252,31 +302,11 @@ fn main() -> Result<()> {
                 Ok(_) => {}
                 Err(e) => log::warn!("Error sending status: {:?}", e),
             }
-            // let status_text = format!(
-            //     "Version: {}.{}.{}\nConnected: {}\nIP: {}\nDisplay OK: {}\nHaptic OK: {}\nHeart OK: {}",
-            //     status.version[0],
-            //     status.version[1],
-            //     status.version[2],
-            //     status.connected,
-            //     ip_info.ip,
-            //     status.display_ok,
-            //     status.haptic_ok,
-            //     status.heart_ok
-            // );
-
-            // display
-            //     .clear(Rgb565::BLACK)
-            //     .map_err(|_| anyhow!("clear display"))
-            //     .unwrap();
-
-            // get_styled_text(&status_text, 100, 0)
-            //     .draw(&mut display)
-            //     .map_err(|_| anyhow!("draw text"))
-            //     .unwrap();
         });
     }
 
     let mut pulse_sensor = pulse_sensor::PulseSensor::new();
+    let mut i = 4;
 
     block_on(async {
         loop {
@@ -287,16 +317,11 @@ fn main() -> Result<()> {
             pulse_sensor.process_latest_sample();
 
             if pulse_sensor.saw_start_of_beat() {
-                let bpm = pulse_sensor.get_beats_per_minute();
-                let ibi = pulse_sensor.get_inter_beat_interval_ms();
-                let last_beat_time = pulse_sensor.get_last_beat_time();
                 haptic.set_go(true)?;
-                log::info!(
-                    "BPM: {}, IBI: {}, Last Beat Time: {}",
-                    bpm,
-                    ibi,
-                    last_beat_time
-                );
+            }
+
+            if !status.lock().unwrap().connected {
+                continue;
             }
 
             samples[i..i + 2].copy_from_slice(&signal.to_be_bytes());
