@@ -1,3 +1,9 @@
+use anyhow::{Ok, Result};
+use esp_idf_svc::{
+    eth::EspEth, eventloop::EspSystemEventLoop, hal::task::block_on, ipv4::IpInfo,
+    timer::EspTaskTimerService,
+};
+
 #[macro_export]
 macro_rules! i2c_init {
     ($i2c:expr, $sda:expr, $scl:expr) => {{
@@ -41,7 +47,7 @@ macro_rules! adc_init {
 macro_rules! eth_init {
     ($spi_driver:expr, $eth_int:expr, $eth_cs:expr, $eth_rst:expr, $sys_loop:expr) => {{
         esp_idf_svc::eth::EspEth::wrap(esp_idf_svc::eth::EthDriver::new_spi(
-            $spi_driver,
+            $spi_driver.clone(),
             $eth_int,
             Some($eth_cs),
             Some($eth_rst),
@@ -69,7 +75,7 @@ macro_rules! display_init {
         let rst = rst.unwrap();
 
         let spi_device = spi::SpiDeviceDriver::new(
-            $spi_driver,
+            $spi_driver.clone(),
             Some($tft_cs_pin),
             &spi::config::Config::new()
                 .baudrate(26.MHz().into())
@@ -88,4 +94,30 @@ macro_rules! display_init {
             .init(&mut delay::Ets)
             .map_err(|_| anyhow!("Failed to initialize display"))
     }};
+}
+
+pub fn connect_eth<T>(
+    eth: &mut EspEth<T>,
+    sys_loop: EspSystemEventLoop,
+    timer_service: EspTaskTimerService,
+) -> Result<IpInfo> {
+    block_on(async {
+        let mut eth_async = esp_idf_svc::eth::AsyncEth::wrap(eth, sys_loop.clone(), timer_service)?;
+
+        log::info!("Starting eth...");
+
+        if !eth_async.eth().is_started()? {
+            eth_async.start().await?;
+        }
+
+        log::info!("Waiting for DHCP lease...");
+
+        eth_async.wait_netif_up().await?;
+
+        let ip_info = eth_async.eth().netif().get_ip_info()?;
+
+        log::info!("Eth DHCP info: {:?}", ip_info);
+
+        Ok(ip_info)
+    })
 }

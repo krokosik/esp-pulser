@@ -10,6 +10,7 @@ use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use embedded_svc::http::client::Client;
 use embedded_svc::http::Headers;
+use esp_idf_svc::ipv4::IpInfo;
 use http::{header::ACCEPT, Uri};
 use mipidsi::{models::ST7789, options::*, Builder};
 
@@ -27,7 +28,7 @@ use esp_idf_svc::hal::{
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::ota::{EspFirmwareInfoLoader, EspOta, FirmwareInfo};
-use esp_idf_svc::sys::{EspError, ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
+use esp_idf_svc::sys::{ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
 
 use esp_pulser::*;
 mod pulse_sensor;
@@ -42,7 +43,7 @@ const UPDATE_BIN_URL: &str =
 #[derive(Debug, serde::Serialize)]
 struct Status {
     version: [u8; 3],
-    connected: bool,
+    ip_info: Option<IpInfo>,
     display_ok: bool,
     haptic_ok: bool,
     heart_ok: bool,
@@ -76,7 +77,7 @@ impl Status {
         }
         Self {
             version,
-            connected: false,
+            ip_info: None,
             display_ok: false,
             haptic_ok: false,
             heart_ok: false,
@@ -102,48 +103,30 @@ fn main() -> Result<()> {
     let mut i2c_power = PinDriver::output(pins.gpio7)?;
     i2c_power.set_high()?;
 
-    let spi_driver = spi_init!(peripherals.spi2, pins.gpio36, pins.gpio35, pins.gpio37)?;
+    let spi_driver = Arc::new(spi_init!(
+        peripherals.spi2,
+        pins.gpio36,
+        pins.gpio35,
+        pins.gpio37
+    )?);
 
-    let eth = eth_init!(&spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop);
+    let mut eth = eth_init!(spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop)?;
 
-    let eth_ip_info = match eth {
-        Ok(mut eth) => block_on(async {
-            let mut eth_async =
-                esp_idf_svc::eth::AsyncEth::wrap(&mut eth, sys_loop.clone(), timer_service)?;
+    let ip_info = connect_eth(&mut eth, sys_loop.clone(), timer_service.clone());
 
-            log::info!("Starting eth...");
+    let eth = Arc::new(Mutex::new(eth));
 
-            eth_async.start().await?;
-
-            log::info!("Waiting for DHCP lease...");
-
-            eth_async.wait_netif_up().await?;
-
-            let ip_info = eth_async.eth().netif().get_ip_info()?;
-
-            log::info!("Eth DHCP info: {:?}", ip_info);
-
-            Result::<_, EspError>::Ok((eth, ip_info))
-        }),
-        Err(e) => {
-            log::warn!("Failed to initialize eth: {:?}", e);
-            Err(e)
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(5));
+        let mut eth = eth.lock().unwrap();
+        if let Ok(false) = eth.is_connected() {
+            if let Err(e) = connect_eth(&mut eth, sys_loop.clone(), timer_service.clone()) {
+                log::warn!("Error connecting eth: {:?}", e);
+            }
         }
-    };
+    });
 
-    status.connected = eth_ip_info.is_ok();
-
-    let (_eth, ip_info) = match eth_ip_info {
-        Ok((eth, ip_info)) => (Some(eth), Some(ip_info)),
-        Err(_) => (None, None),
-    };
-
-    // if status.connected {
-    //     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    //     let logger: UdpLogger = UdpLogger { tx };
-    //     log::set_boxed_logger(Box::new(logger)).unwrap();
-    //     log::set_max_level(log::LevelFilter::Info);
-    // }
+    status.ip_info = ip_info.ok();
 
     log::info!("Starting ADC");
     let mut adc = adc_init!(peripherals.adc2, pins.gpio18)?;
@@ -182,8 +165,7 @@ fn main() -> Result<()> {
         let udp_socket = udp_socket.lock().unwrap();
         log::info!("Socket bound to {:?}", udp_socket.local_addr()?);
     }
-
-    if status.connected {
+    {
         let udp_socket = udp_socket.clone();
         thread::Builder::new().stack_size(8 * 1024).spawn(move || {
             let tcp_socket =
@@ -259,13 +241,13 @@ fn main() -> Result<()> {
         })
     });
 
-    let display = display_init!(&spi_driver, pins.gpio42, pins.gpio40, pins.gpio41);
+    let display = display_init!(spi_driver, pins.gpio42, pins.gpio40, pins.gpio41);
 
     status.display_ok = display.is_ok();
 
     if display.is_ok() {
         let mut display = display.unwrap();
-        if ip_info.is_none() {
+        if status.ip_info.is_none() {
             display
                 .clear(Rgb565::RED)
                 .map_err(|_| anyhow!("clear display"))?;
@@ -279,7 +261,7 @@ fn main() -> Result<()> {
                 .map_err(|_| anyhow!("clear display"))?;
 
             get_styled_text(
-                &["Connected", &ip_info.unwrap().ip.to_string()].join("\n"),
+                &["Connected", &status.ip_info.unwrap().ip.to_string()].join("\n"),
                 100,
                 50,
             )
@@ -318,10 +300,6 @@ fn main() -> Result<()> {
 
             if pulse_sensor.saw_start_of_beat() {
                 haptic.set_go(true)?;
-            }
-
-            if !status.lock().unwrap().connected {
-                continue;
             }
 
             samples[i..i + 2].copy_from_slice(&signal.to_be_bytes());
