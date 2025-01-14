@@ -5,40 +5,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
-use display_interface_spi::SPIInterface;
-use drv2605::{Drv2605, Effect};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
-use embedded_svc::http::client::Client;
-use embedded_svc::http::Headers;
-use esp_idf_svc::ipv4::IpInfo;
-use http::{header::ACCEPT, Uri};
-use mipidsi::{models::ST7789, options::*, Builder};
 
-use esp_idf_svc::hal::{
-    adc, delay,
-    gpio::PinDriver,
-    i2c,
-    prelude::*,
-    reset::restart,
-    spi,
-    task::block_on,
-    timer::{TimerConfig, TimerDriver},
-    units::FromValueType,
-};
-use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
-use esp_idf_svc::http::Method;
-use esp_idf_svc::ota::{EspFirmwareInfoLoader, EspOta, FirmwareInfo};
-use esp_idf_svc::sys::{ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
+use esp_idf_svc::ipv4::IpInfo;
+use http::Uri;
+use max3010x::Max3010x;
+
+use embedded_hal_bus::i2c as i2c_bus;
+use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 
 use esp_pulser::*;
-mod pulse_sensor;
+mod drv2605;
+mod ota;
+// mod pulse_sensor;
 
 const SAMPLING_RATE_HZ: u64 = 500;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const UPDATE_BIN_URL: &str =
-    "https://github.com/krokosik/esp-pulser/releases/download/vTAG/esp-pulser";
 
 #[derive(Debug, serde::Serialize)]
 struct Status {
@@ -48,26 +31,6 @@ struct Status {
     haptic_ok: bool,
     heart_ok: bool,
 }
-
-// struct UdpLogger {
-//     tx: std::sync::mpsc::Sender<String>,
-// }
-
-// impl log::Log for UdpLogger {
-//     fn enabled(&self, metadata: &log::Metadata) -> bool {
-//         metadata.level() <= log::Level::Info
-//     }
-
-//     fn log(&self, record: &log::Record) {
-//         if self.enabled(record.metadata()) {
-//             self.tx
-//                 .send(format!("{} - {}", record.level(), record.args()))
-//                 .unwrap();
-//         }
-//     }
-
-//     fn flush(&self) {}
-// }
 
 impl Status {
     fn new() -> Self {
@@ -96,65 +59,74 @@ fn main() -> Result<()> {
     let mut status = Status::new();
 
     let peripherals = Peripherals::take()?;
-    let pins = peripherals.pins;
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
     let timer_service = esp_idf_svc::timer::EspTaskTimerService::new()?;
 
-    let mut i2c_power = PinDriver::output(pins.gpio7)?;
-    i2c_power.set_high()?;
+    let mut board = Board::new(peripherals, sys_loop.clone(), timer_service.clone());
 
-    let spi_driver = Arc::new(spi_init!(
-        peripherals.spi2,
-        pins.gpio36,
-        pins.gpio35,
-        pins.gpio37
-    )?);
+    status.display_ok = board.display_driver.is_some();
 
-    let mut eth = eth_init!(spi_driver, pins.gpio13, pins.gpio10, pins.gpio12, sys_loop)?;
+    status.ip_info = match &mut board.eth_driver {
+        Some(ref mut eth) => connect_eth(eth).ok(),
+        None => None,
+    };
 
-    let ip_info = connect_eth(&mut eth, sys_loop.clone(), timer_service.clone());
+    let eth = Arc::new(Mutex::new(board.eth_driver));
 
-    let eth = Arc::new(Mutex::new(eth));
+    thread::spawn(move || {
+        let eth = eth.clone();
+        let mut error_count = 0;
+        loop {
+            thread::sleep(std::time::Duration::from_secs(5));
+            let mut eth = eth.lock().unwrap();
 
-    thread::spawn(move || loop {
-        thread::sleep(std::time::Duration::from_secs(5));
-        let mut eth = eth.lock().unwrap();
-        if let Ok(false) = eth.is_connected() {
-            if let Err(e) = connect_eth(&mut eth, sys_loop.clone(), timer_service.clone()) {
-                log::warn!("Error connecting eth: {:?}", e);
+            if let Some(ref mut eth) = *eth {
+                if let Ok(false) = eth.is_connected() {
+                    if let Err(e) = connect_eth(eth) {
+                        if error_count < 3 {
+                            error_count += 1;
+                            log::warn!("Error connecting eth: {:?}", e);
+                        }
+                    } else {
+                        error_count = 0;
+                    }
+                }
             }
         }
     });
 
-    status.ip_info = ip_info.ok();
-
-    log::info!("Starting ADC");
-    let mut adc = adc_init!(peripherals.adc2, pins.gpio18)?;
-
-    status.heart_ok = true;
-
-    log::info!("ADC started");
-
     let mut samples = [0u8; 2 * 100 + 4];
 
-    let mut backlight = PinDriver::output(pins.gpio45)?;
-    let mut d1_button = PinDriver::input(pins.gpio1)?;
-    d1_button.set_pull(esp_idf_svc::hal::gpio::Pull::Down)?;
+    let mut haptic = drv2605::Drv2605::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
+    haptic.set_overdrive_time_offset(20)?;
+    haptic.calibrate(255)?;
+    haptic.init_open_loop_erm()?;
+    haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
+    // status.haptic_ok = haptic
+    //     .init_open_loop_erm()
+    //     .and_then(|_| haptic.set_single_effect(Effect::StrongBuzz100))
+    //     .is_ok();
 
-    let i2c_driver = i2c_init!(peripherals.i2c0, pins.gpio3, pins.gpio4)?;
-
-    let mut haptic = Drv2605::new(i2c_driver);
-
-    log::info!("Haptic driver says: {:?}", haptic.init_open_loop_erm());
-
-    log::info!(
-        "Haptic driver effect set to: {:?}",
-        haptic.set_single_effect(Effect::PulsingStrongOne100)
-    );
-
-    status.haptic_ok = true;
-
-    let mut timer = TimerDriver::new(peripherals.timer00, &TimerConfig::new())?;
+    let heart = Max3010x::new_max30102(i2c_bus::RefCellDevice::new(&board.i2c_driver));
+    let mut heart = heart.into_oximeter().unwrap();
+    heart
+        .set_sample_averaging(max3010x::SampleAveraging::Sa4)
+        .unwrap();
+    heart
+        .set_sampling_rate(max3010x::SamplingRate::Sps400)
+        .unwrap();
+    heart.set_pulse_amplitude(max3010x::Led::All, 255).unwrap();
+    heart
+        .set_pulse_width(max3010x::LedPulseWidth::Pw411)
+        .unwrap();
+    heart.enable_fifo_rollover().unwrap();
+    heart.clear_fifo().unwrap();
+    // status.heart_ok = heart
+    //     .set_sample_averaging(max3010x::SampleAveraging::Sa4)
+    //     .and_then(|_| heart.enable_fifo_rollover())
+    //     .and_then(|_| heart.set_pulse_amplitude(max3010x::Led::All, 200))
+    //     .and_then(|_| heart.set_pulse_width(max3010x::LedPulseWidth::Pw411))
+    //     .is_ok();
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
@@ -202,9 +174,11 @@ fn main() -> Result<()> {
                                             log::info!("Attempting update...");
                                             let data =
                                                 String::from_utf8(buf[1..n].to_vec()).unwrap();
-                                            let update_url = UPDATE_BIN_URL.replace("TAG", &data);
+                                            let update_url =
+                                                ota::UPDATE_BIN_URL.replace("TAG", &data);
                                             if let Ok(u) = Uri::try_from(update_url) {
-                                                simple_download_and_update_firmware(u).unwrap();
+                                                ota::simple_download_and_update_firmware(u)
+                                                    .unwrap();
                                             } else {
                                                 log::warn!("Invalid URL to download firmware");
                                             }
@@ -233,20 +207,16 @@ fn main() -> Result<()> {
     thread::spawn(move || {
         block_on(async {
             loop {
-                d1_button.wait_for_high().await.unwrap();
-                backlight.set_high().unwrap();
-                d1_button.wait_for_low().await.unwrap();
-                backlight.set_low().unwrap();
+                board.d1_btn.wait_for_high().await.unwrap();
+                board.backlight.set_high().unwrap();
+                board.d1_btn.wait_for_low().await.unwrap();
+                board.backlight.set_low().unwrap();
             }
         })
     });
 
-    let display = display_init!(spi_driver, pins.gpio42, pins.gpio40, pins.gpio41);
-
-    status.display_ok = display.is_ok();
-
-    if display.is_ok() {
-        let mut display = display.unwrap();
+    if board.display_driver.is_some() {
+        let mut display = board.display_driver.unwrap();
         if status.ip_info.is_none() {
             display
                 .clear(Rgb565::RED)
@@ -287,29 +257,37 @@ fn main() -> Result<()> {
         });
     }
 
-    let mut pulse_sensor = pulse_sensor::PulseSensor::new();
     let mut i = 4;
 
+    let mut data = [0; 3];
     block_on(async {
         loop {
-            timer.delay(timer.tick_hz() / SAMPLING_RATE_HZ).await?;
+            board
+                .timer
+                .delay(board.timer.tick_hz() / SAMPLING_RATE_HZ)
+                .await?;
 
-            let signal = adc.read_raw()?;
-            pulse_sensor.read_next_sample(signal);
-            pulse_sensor.process_latest_sample();
+            // let samples_read = heart.read_fifo(&mut data).unwrap();
 
-            if pulse_sensor.saw_start_of_beat() {
-                haptic.set_go(true)?;
-            }
+            // log::info!("Samples read: {:?}", samples_read);
+            // log::info!("Data: {:?}", data);
 
-            samples[i..i + 2].copy_from_slice(&signal.to_be_bytes());
+            // // let signal = adc.read_raw()?;
+            // // pulse_sensor.read_next_sample(signal);
+            // // pulse_sensor.process_latest_sample();
+
+            // // if pulse_sensor.saw_start_of_beat() {
+            // //     haptic.set_go(true)?;
+            // // }
+
+            // samples[i..i + 2].copy_from_slice(&signal.to_be_bytes());
             i += 2;
 
             if i >= samples.len() {
                 i = 4;
-                samples[0..2].copy_from_slice(&pulse_sensor.get_beats_per_minute().to_be_bytes());
-                samples[2..4]
-                    .copy_from_slice(&pulse_sensor.get_inter_beat_interval_ms().to_be_bytes());
+                // samples[0..2].copy_from_slice(&pulse_sensor.get_beats_per_minute().to_be_bytes());
+                // samples[2..4]
+                //     .copy_from_slice(&pulse_sensor.get_inter_beat_interval_ms().to_be_bytes());
                 match udp_socket.lock().unwrap().send(&samples) {
                     Ok(_) => (),
                     Err(e) => {
@@ -333,82 +311,4 @@ fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>
 
     // Create a text at position (20, 30) and draw it using the previously defined style.
     Text::with_text_style(text, Point::new(x, y), character_style, text_style)
-}
-
-const FIRMWARE_DOWNLOAD_CHUNK_SIZE: usize = 1024 * 20;
-// Not expect firmware bigger than partition size
-const FIRMWARE_MAX_SIZE: usize = 1_310_720;
-const FIRMWARE_MIN_SIZE: usize = size_of::<FirmwareInfo>() + 1024;
-
-pub fn simple_download_and_update_firmware(url: Uri) -> Result<()> {
-    let mut client = Client::wrap(EspHttpConnection::new(&Configuration {
-        buffer_size: Some(1024 * 6),
-        buffer_size_tx: Some(1024),
-        use_global_ca_store: true,
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        ..Default::default()
-    })?);
-    let headers = [(ACCEPT.as_str(), mime::APPLICATION_OCTET_STREAM.as_ref())];
-    let surl = url.to_string();
-    let request = client
-        .request(Method::Get, &surl, &headers)
-        .map_err(|e| e.0)?;
-    let mut response = request.submit().map_err(|e| e.0)?;
-    if response.status() != 200 {
-        log::info!("Bad HTTP response: {}", response.status());
-        return Err(anyhow!(ESP_ERR_INVALID_RESPONSE));
-    }
-    let file_size = response.content_len().unwrap_or(0) as usize;
-    if file_size <= FIRMWARE_MIN_SIZE {
-        log::info!(
-            "File size is {file_size}, too small to be a firmware! No need to proceed further."
-        );
-        return Err(anyhow!(ESP_ERR_IMAGE_INVALID));
-    }
-    if file_size > FIRMWARE_MAX_SIZE {
-        log::info!("File is too big ({file_size} bytes).");
-        return Err(anyhow!(ESP_ERR_IMAGE_INVALID));
-    }
-    let mut ota = EspOta::new()?;
-    let mut work = ota.initiate_update()?;
-    let mut buff = vec![0; FIRMWARE_DOWNLOAD_CHUNK_SIZE];
-    let mut total_read_len: usize = 0;
-    let mut got_info = false;
-    let dl_result = loop {
-        let n = response.read(&mut buff).unwrap_or_default();
-        total_read_len += n;
-        if !got_info {
-            match get_firmware_info(&buff[..n]) {
-                Ok(info) => log::info!("Firmware to be downloaded: {info:?}"),
-                Err(e) => {
-                    log::error!("Failed to get firmware info from downloaded bytes!");
-                    break Err(e);
-                }
-            };
-            got_info = true;
-        }
-        if n > 0 {
-            if let Err(e) = work.write(&buff[..n]) {
-                log::error!("Failed to write to OTA. {e}");
-                break Err(anyhow!(e));
-            }
-        }
-        if total_read_len >= file_size {
-            break Ok(());
-        }
-    };
-    if dl_result.is_err() {
-        return work.abort().map_err(|e| anyhow!(e));
-    }
-    if total_read_len < file_size {
-        log::error!("Supposed to download {file_size} bytes, but we could only get {total_read_len}. May be network error?");
-        return work.abort().map_err(|e| anyhow!(e));
-    }
-    work.complete().map_err(|e| anyhow!(e))
-}
-
-fn get_firmware_info(buff: &[u8]) -> Result<FirmwareInfo> {
-    let mut loader = EspFirmwareInfoLoader::new();
-    loader.load(buff)?;
-    loader.get_info().map_err(|e| anyhow!(e))
 }
