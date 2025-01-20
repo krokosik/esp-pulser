@@ -17,9 +17,10 @@ use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 use esp_pulser::*;
 mod drv2605;
 mod ota;
-// mod pulse_sensor;
+mod pulse_sensor;
 
-const SAMPLING_RATE_HZ: u64 = 500;
+const SAMPLING_RATE_HZ: u64 = 1000;
+const SAMPLES_PER_PACKET: usize = 200;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let mut samples = [0u8; 2 * 100 + 4];
+    let mut samples = [0u8; 4 * (SAMPLES_PER_PACKET + 2)];
 
     let mut haptic = drv2605::Drv2605::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
     haptic.set_overdrive_time_offset(20)?;
@@ -108,25 +109,28 @@ fn main() -> Result<()> {
     //     .is_ok();
 
     let heart = Max3010x::new_max30102(i2c_bus::RefCellDevice::new(&board.i2c_driver));
-    let mut heart = heart.into_oximeter().unwrap();
+
+    // Fs = 31.25 Hz
+    let mut heart = heart.into_heart_rate().unwrap();
     heart
-        .set_sample_averaging(max3010x::SampleAveraging::Sa4)
+        .set_sample_averaging(max3010x::SampleAveraging::Sa32)
         .unwrap();
     heart
-        .set_sampling_rate(max3010x::SamplingRate::Sps400)
+        .set_sampling_rate(max3010x::SamplingRate::Sps1000)
         .unwrap();
-    heart.set_pulse_amplitude(max3010x::Led::All, 255).unwrap();
+    heart.set_pulse_amplitude(max3010x::Led::Led1, 15).unwrap();
     heart
         .set_pulse_width(max3010x::LedPulseWidth::Pw411)
         .unwrap();
     heart.enable_fifo_rollover().unwrap();
-    heart.clear_fifo().unwrap();
     // status.heart_ok = heart
     //     .set_sample_averaging(max3010x::SampleAveraging::Sa4)
     //     .and_then(|_| heart.enable_fifo_rollover())
     //     .and_then(|_| heart.set_pulse_amplitude(max3010x::Led::All, 200))
     //     .and_then(|_| heart.set_pulse_width(max3010x::LedPulseWidth::Pw411))
     //     .is_ok();
+    // let mut heart =
+    //     dfrobot_max30102::DFRobotBloodOxygenS::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
@@ -257,9 +261,13 @@ fn main() -> Result<()> {
         });
     }
 
-    let mut i = 4;
+    let mut pulse_sensor = pulse_sensor::PulseSensor::new(18);
+    let mut i = 8;
 
     let mut data = [0; 3];
+
+    heart.clear_fifo().unwrap();
+
     block_on(async {
         loop {
             board
@@ -267,27 +275,30 @@ fn main() -> Result<()> {
                 .delay(board.timer.tick_hz() / SAMPLING_RATE_HZ)
                 .await?;
 
-            // let samples_read = heart.read_fifo(&mut data).unwrap();
+            let samples_read = heart.read_fifo(&mut data).unwrap() as usize;
 
-            // log::info!("Samples read: {:?}", samples_read);
-            // log::info!("Data: {:?}", data);
+            // let signal = adc.read_raw()?;
 
-            // // let signal = adc.read_raw()?;
-            // // pulse_sensor.read_next_sample(signal);
-            // // pulse_sensor.process_latest_sample();
+            if pulse_sensor.saw_start_of_beat() {
+                haptic.set_go(true)?;
+            }
 
-            // // if pulse_sensor.saw_start_of_beat() {
-            // //     haptic.set_go(true)?;
-            // // }
-
-            // samples[i..i + 2].copy_from_slice(&signal.to_be_bytes());
-            i += 2;
+            for signal in data.iter().take(samples_read) {
+                pulse_sensor.read_next_sample(*signal);
+                pulse_sensor.process_latest_sample();
+                if i < samples.len() {
+                    samples[i..i + 4].copy_from_slice(&signal.to_be_bytes());
+                    i += 4;
+                }
+            }
 
             if i >= samples.len() {
-                i = 4;
-                // samples[0..2].copy_from_slice(&pulse_sensor.get_beats_per_minute().to_be_bytes());
-                // samples[2..4]
-                //     .copy_from_slice(&pulse_sensor.get_inter_beat_interval_ms().to_be_bytes());
+                i = 8;
+                samples[0..4]
+                    .copy_from_slice(&(pulse_sensor.get_beats_per_minute() as u32).to_be_bytes());
+                samples[4..8].copy_from_slice(
+                    &(pulse_sensor.get_inter_beat_interval_ms() as u32).to_be_bytes(),
+                );
                 match udp_socket.lock().unwrap().send(&samples) {
                     Ok(_) => (),
                     Err(e) => {

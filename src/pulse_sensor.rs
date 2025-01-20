@@ -1,11 +1,9 @@
-const ESP32_ADC_RESOLUTION: u16 = 4095;
-
 #[derive(Debug)]
 pub struct PulseSensor {
     /// holds raw Analog in 0. updated every call to read_sensor()
     bpm: u16,
     /// holds the latest incoming raw data (0..4095)
-    signal: u16,
+    signal: u32,
     /// holds the time interval (ms) between beats! Must be seeded!
     ibi: u16,
     /// "true" when User's live heartbeat is detected. "false" when not a "live beat".
@@ -13,9 +11,9 @@ pub struct PulseSensor {
     /// The start of beat has been detected and not read by the Sketch.
     qs: bool,
     /// used to seed and reset the thresh variable
-    thresh_setting: u16,
+    thresh_setting: u32,
     /// used to hold amplitude of pulse waveform, seeded (sample value)
-    amp: u16,
+    amp: u32,
     /// used to find IBI. Time (sample_counter) of the previous detected beat start.
     last_beat_time: u32,
 
@@ -28,38 +26,42 @@ pub struct PulseSensor {
     /// used to monitor duration between beats
     n: u16,
     /// used to find peak in pulse wave, seeded (sample value)
-    p: u16,
+    p: u32,
     /// used to find trough in pulse wave, seeded (sample value)
-    t: u16,
+    t: u32,
     /// used to find instant moment of heart beat, seeded (sample value)
-    thresh: u16,
+    thresh: u32,
     /// used to seed rate array so we startup with reasonable BPM
     first_beat: bool,
     /// used to seed rate array so we startup with reasonable BPM
     second_beat: bool,
+
+    adc_range: u32,
 }
 
 impl PulseSensor {
     // Constructs a PulseSensor manager using a default configuration.
-    pub fn new() -> Self {
+    pub fn new(adc_range_bits: u8) -> Self {
+        let adc_range = (1_u32 << adc_range_bits) - 1;
         Self {
             bpm: 0,
             signal: 0,
             ibi: 750, // 750ms per beat = 80 Beats Per Minute (BPM)
             pulse: false,
             qs: false,
-            thresh_setting: ESP32_ADC_RESOLUTION / 10 * 6,
-            amp: ESP32_ADC_RESOLUTION / 10, // beat amplitude 1/10 of input range.
+            thresh_setting: adc_range / 10 * 6,
+            amp: adc_range / 10, // beat amplitude 1/10 of input range.
             last_beat_time: 0,
             sample_interval_ms: 2, // 500 Hz
             rate: [0; 10],
             sample_counter: 0,
             n: 0,
-            p: ESP32_ADC_RESOLUTION / 2, // peak at 1/2 the input range of 0..1023
-            t: ESP32_ADC_RESOLUTION / 2, // trough at 1/2 the input range.
-            thresh: ESP32_ADC_RESOLUTION / 10 * 6,
+            p: adc_range / 2, // peak at 1/2 the input range of 0..1023
+            t: adc_range / 2, // trough at 1/2 the input range.
+            thresh: adc_range / 10 * 6,
             first_beat: true,   // looking for the first beat
             second_beat: false, // not yet looking for the second beat in a row
+            adc_range,
         }
     }
 
@@ -71,10 +73,10 @@ impl PulseSensor {
         self.pulse = false;
         self.sample_counter = 0;
         self.last_beat_time = 0;
-        self.p = ESP32_ADC_RESOLUTION / 2;
-        self.t = ESP32_ADC_RESOLUTION / 2;
+        self.p = self.adc_range / 2;
+        self.t = self.adc_range / 2;
         self.thresh = self.thresh_setting;
-        self.amp = ESP32_ADC_RESOLUTION / 10;
+        self.amp = self.adc_range / 10;
         self.first_beat = true;
         self.second_beat = false;
     }
@@ -117,7 +119,7 @@ impl PulseSensor {
     }
 
     // (internal to the library) Read a sample from this PulseSensor.
-    pub fn read_next_sample(&mut self, sample: u16) {
+    pub fn read_next_sample(&mut self, sample: u32) {
         self.signal = sample;
     }
 
