@@ -1,4 +1,3 @@
-use std::future::IntoFuture;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -7,6 +6,7 @@ use std::thread;
 
 use anyhow::{anyhow, Result};
 use circ::Circ;
+use drv2605::CalibrationParams;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 
 use esp_idf_svc::ipv4::IpInfo;
@@ -19,7 +19,6 @@ use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 use esp_pulser::*;
 use pulse_sensor::{MAX30102_NUM_SAMPLES, MAX30102_SAMPLE_RATE};
 mod circ;
-mod drv2605;
 mod linreg;
 mod ota;
 mod pulse_sensor;
@@ -81,7 +80,13 @@ fn main() -> Result<()> {
 
     let mut haptic = drv2605::Drv2605::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
     haptic.set_overdrive_time_offset(20)?;
-    haptic.calibrate(255)?;
+    haptic.calibrate(CalibrationParams {
+        brake_factor: 2,
+        loop_gain: 2,
+        auto_cal_time: 4,
+        overdrive_clamp_voltage: 255,
+        rated_voltage: 234,
+    })?;
     haptic.init_open_loop_erm()?;
     haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
 
