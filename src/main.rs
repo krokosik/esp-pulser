@@ -117,69 +117,9 @@ fn main() -> Result<()> {
     }
     {
         let udp_socket = udp_socket.clone();
-        thread::Builder::new().stack_size(8 * 1024).spawn(move || {
-            let tcp_socket =
-                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
-
-            log::info!("Listening for GUI client...");
-
-            loop {
-                match tcp_socket.accept() {
-                    Ok((mut stream, addr)) => {
-                        log::info!("Connection from: {:?}", addr);
-
-                        let mut buf = [0; 10];
-                        loop {
-                            match stream.read(&mut buf) {
-                                Ok(0) => {
-                                    log::info!("Connection closed");
-                                    break;
-                                }
-                                Ok(2) => {
-                                    let port = u16::from_be_bytes([buf[0], buf[1]]);
-                                    let udp_target = SocketAddr::new(addr.ip(), port);
-                                    log::info!("Connecting to UDP socket at: {}", udp_target);
-                                    udp_socket.lock().unwrap().connect(udp_target).unwrap();
-                                }
-                                Ok(n) => {
-                                    log::info!("Received TCP command: {:?}", buf[0]);
-                                    match buf[0] {
-                                        0 => {
-                                            log::info!("Restarting...");
-                                            restart();
-                                        }
-                                        1 => {
-                                            log::info!("Attempting update...");
-                                            let data =
-                                                String::from_utf8(buf[1..n].to_vec()).unwrap();
-                                            let update_url =
-                                                ota::UPDATE_BIN_URL.replace("TAG", &data);
-                                            if let Ok(u) = Uri::try_from(update_url) {
-                                                ota::simple_download_and_update_firmware(u)
-                                                    .unwrap();
-                                            } else {
-                                                log::warn!("Invalid URL to download firmware");
-                                            }
-                                            restart();
-                                        }
-                                        _ => {
-                                            log::info!("Unknown command");
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Error receiving data: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("Error accepting connection: {:?}", e);
-                    }
-                }
-            }
-        })?;
+        thread::Builder::new()
+            .stack_size(8 * 1024)
+            .spawn(move || tcp_receiver_task(udp_socket))?;
     }
 
     thread::spawn(move || {
@@ -303,6 +243,67 @@ fn eth_reconnect_task(eth: Arc<Mutex<Option<EthPeripheral>>>, ip_info: Arc<Mutex
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn tcp_receiver_task(udp_socket: Arc<Mutex<UdpSocket>>) {
+    let tcp_socket =
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
+
+    log::info!("Listening for GUI client...");
+
+    loop {
+        match tcp_socket.accept() {
+            Ok((mut stream, addr)) => {
+                log::info!("Connection from: {:?}", addr);
+
+                let mut buf = [0; 10];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => {
+                            log::info!("Connection closed");
+                            break;
+                        }
+                        Ok(2) => {
+                            let port = u16::from_be_bytes([buf[0], buf[1]]);
+                            let udp_target = SocketAddr::new(addr.ip(), port);
+                            log::info!("Connecting to UDP socket at: {}", udp_target);
+                            udp_socket.lock().unwrap().connect(udp_target).unwrap();
+                        }
+                        Ok(n) => {
+                            log::info!("Received TCP command: {:?}", buf[0]);
+                            match buf[0] {
+                                0 => {
+                                    log::info!("Restarting...");
+                                    restart();
+                                }
+                                1 => {
+                                    log::info!("Attempting update...");
+                                    let data = String::from_utf8(buf[1..n].to_vec()).unwrap();
+                                    let update_url = ota::UPDATE_BIN_URL.replace("TAG", &data);
+                                    if let Ok(u) = Uri::try_from(update_url) {
+                                        ota::simple_download_and_update_firmware(u).unwrap();
+                                    } else {
+                                        log::warn!("Invalid URL to download firmware");
+                                    }
+                                    restart();
+                                }
+                                _ => {
+                                    log::info!("Unknown command");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Error receiving data: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Error accepting connection: {:?}", e);
             }
         }
     }
