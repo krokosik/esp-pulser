@@ -3,7 +3,7 @@ use embedded_svc::http::client::Client;
 use embedded_svc::http::Headers;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
-use esp_idf_svc::ota::{EspFirmwareInfoLoader, EspOta, FirmwareInfo};
+use esp_idf_svc::ota::{EspFirmwareInfoLoad, EspOta, FirmwareInfo};
 use esp_idf_svc::sys::{ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
 use http::{header::ACCEPT, Uri};
 
@@ -83,7 +83,14 @@ pub fn simple_download_and_update_firmware(url: Uri) -> Result<()> {
 }
 
 fn get_firmware_info(buff: &[u8]) -> Result<FirmwareInfo> {
-    let mut loader = EspFirmwareInfoLoader::new();
-    loader.load(buff)?;
-    loader.get_info().map_err(|e| anyhow!(e))
+    let mut info = FirmwareInfo {
+        version: heapless::String::new(),
+        released: heapless::String::new(),
+        description: Some(heapless::String::new()),
+        signature: Some(heapless::Vec::new()),
+        download_id: None,
+    };
+    let loader = EspFirmwareInfoLoad;
+    loader.fetch(buff, &mut info)?;
+    Ok(info)
 }

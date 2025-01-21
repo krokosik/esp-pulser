@@ -83,7 +83,7 @@ impl Max3012SampleData {
 
             if hb_val_diff > hb_threshold {
                 let _ = self.heartbeats.push(hb);
-                for lhb in last_hb_idx {
+                if let Some(lhb) = last_hb_idx {
                     let _ = hb_dist.push(hb.high_idx - lhb);
                 }
 
@@ -99,7 +99,7 @@ impl Max3012SampleData {
                 hb_dist.pop();
             }
 
-            for hbd in hb_dist.pop() {
+            if let Some(hbd) = hb_dist.pop() {
                 self.heart_rate_bpm = Some(60.0 * MAX30102_SAMPLE_RATE.0 as f32 / hbd as f32);
             }
         }
