@@ -3,7 +3,7 @@
 #[derive(Copy, Clone, Debug)]
 pub struct Circ<T, const COUNT: usize> {
     pub data: [T; COUNT],
-    next: usize,
+    pub next: usize,
 }
 
 impl<T, const COUNT: usize> Circ<T, COUNT>
@@ -75,7 +75,7 @@ where
 }
 
 #[inline]
-fn wrap_next<const COUNT: usize>(n: usize) -> usize {
+pub fn wrap_next<const COUNT: usize>(n: usize) -> usize {
     let n1 = n + 1;
     if n1 >= COUNT {
         0

@@ -35,7 +35,7 @@ serde = { version = "1.0.217", features = ["derive"] }
 mime = "0.3.17"
 http = "1.2.0"
 max3010x = "0.2.0"
-embedded-hal-bus = "0.2.0"
+embedded-hal-bus = { features = ["std"], version="0.2.0" }
 embedded-hal = "1.0.0"
 bitfield = "0.17.0"
 heapless = "0.8.0"

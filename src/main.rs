@@ -2,18 +2,20 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use circ::Circ;
 use drv2605::CalibrationParams;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 
+use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::ipv4::IpInfo;
 use http::Uri;
 use max3010x::Max3010x;
 
-use embedded_hal_bus::i2c as i2c_bus;
+use embedded_hal_bus::i2c::MutexDevice;
 use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 
 use esp_pulser::*;
@@ -26,7 +28,7 @@ mod signal;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct Status {
     version: [u8; 3],
     connected: bool,
@@ -51,6 +53,13 @@ impl Status {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+enum Packet {
+    Status(Status),
+    RawHeartRate(f32),
+    Bpm(f32),
+}
+
 fn main() -> Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
@@ -69,52 +78,38 @@ fn main() -> Result<()> {
 
     status.display_ok = board.display_driver.is_some();
 
+    let status: Arc<Mutex<Status>> = Arc::new(Mutex::new(status));
     let ip_info = Arc::new(Mutex::new(None));
     let eth = Arc::new(Mutex::new(board.eth_driver));
+    let i2c_device = Arc::new(board.i2c_driver);
 
     {
         let eth = eth.clone();
         let ip_info = ip_info.clone();
-        thread::spawn(move || eth_reconnect_task(eth, ip_info));
+        let status = status.clone();
+        thread::Builder::new()
+            .stack_size(4 * 1024)
+            .spawn(move || eth_reconnect_task(eth, ip_info, status))?;
     }
 
-    let mut haptic = drv2605::Drv2605::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
-    haptic.set_overdrive_time_offset(20)?;
-    haptic.calibrate(CalibrationParams {
-        brake_factor: 2,
-        loop_gain: 2,
-        auto_cal_time: 4,
-        overdrive_clamp_voltage: 255,
-        rated_voltage: 234,
-    })?;
-    haptic.init_open_loop_erm()?;
-    haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
-
-    let heart = Max3010x::new_max30102(i2c_bus::RefCellDevice::new(&board.i2c_driver));
-
-    // Fs = 25 Hz
-    let mut heart = heart.into_heart_rate().unwrap();
-    heart
-        .set_sample_averaging(max3010x::SampleAveraging::Sa16)
-        .unwrap();
-    heart
-        .set_sampling_rate(max3010x::SamplingRate::Sps400)
-        .unwrap();
-    heart.set_pulse_amplitude(max3010x::Led::Led1, 35).unwrap();
-    heart
-        .set_pulse_width(max3010x::LedPulseWidth::Pw411)
-        .unwrap();
-    heart.enable_fifo_rollover().unwrap();
+    let i2c_device_clone = i2c_device.clone();
+    // let mut haptic = drv2605::Drv2605::new(MutexDevice::new(&i2c_device_clone));
+    // haptic.set_overdrive_time_offset(20)?;
+    // haptic.calibrate(CalibrationParams {
+    //     brake_factor: 2,
+    //     loop_gain: 2,
+    //     auto_cal_time: 4,
+    //     overdrive_clamp_voltage: 255,
+    //     rated_voltage: 234,
+    // })?;
+    // haptic.init_open_loop_erm()?;
+    // haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
         3333,
     ))?));
 
-    {
-        let udp_socket = udp_socket.lock().unwrap();
-        log::info!("Socket bound to {:?}", udp_socket.local_addr()?);
-    }
     {
         let udp_socket = udp_socket.clone();
         thread::Builder::new()
@@ -159,70 +154,144 @@ fn main() -> Result<()> {
         }
     }
 
-    let status: Arc<Mutex<Status>> = Arc::new(Mutex::new(status));
-
     {
         let udp_socket = udp_socket.clone();
         let status = status.clone();
 
-        thread::spawn(move || loop {
-            thread::sleep(std::time::Duration::from_secs(1));
-            let status = status.lock().unwrap();
-            let status_bytes = bincode::serialize(&*status).unwrap();
+        thread::spawn(move || status_log_thread(udp_socket, status));
+    }
+
+    let samples = Arc::new(Mutex::new(Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0)));
+    let mut heart_data_channel = pulse_sensor::Max3012SampleData::new();
+    let bpm = Arc::new(Mutex::new(0.0));
+
+    {
+        let samples = samples.clone();
+        let udp_socket = udp_socket.clone();
+        let i2c_device = i2c_device.clone();
+        let status = status.clone();
+        thread::Builder::new()
+            .stack_size(4 * 1024)
+            .spawn(move || heart_sensing_task(samples, udp_socket, i2c_device, status))?;
+    }
+
+    std::thread::sleep(Duration::from_millis(400));
+
+    loop {
+        std::thread::sleep(Duration::from_millis(15));
+        {
+            let samples = samples.lock().unwrap();
+
+            heart_data_channel.update_from_samples(
+                &samples
+                    .into_iter()
+                    .collect::<Vec<f32>>()
+                    .try_into()
+                    .unwrap(),
+            );
+        }
+
+        if heart_data_channel.heartbeats.len() > 6 {
+            let new_bpm = heart_data_channel.heart_rate_bpm.unwrap();
+            if new_bpm > 40.0 && new_bpm < 200.0 {
+                *bpm.lock().unwrap() = new_bpm;
+            } else {
+                *bpm.lock().unwrap() = 0.0;
+            }
+        } else {
+            *bpm.lock().unwrap() = 0.0;
+        }
+
+        if status.lock().unwrap().connected {
+            match udp_socket
+                .lock()
+                .unwrap()
+                .send(&bincode::serialize(&Packet::Bpm(*bpm.lock().unwrap())).unwrap())
+            {
+                Ok(_) => (),
+                Err(e) => log::warn!("Error sending data: {:?}", e),
+            };
+        }
+    }
+}
+
+fn heart_sensing_task(
+    samples: Arc<Mutex<Circ<f32, MAX30102_NUM_SAMPLES>>>,
+    udp_socket: Arc<Mutex<UdpSocket>>,
+    i2c_device: Arc<Mutex<I2cDriver>>,
+    status: Arc<Mutex<Status>>,
+) {
+    let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
+
+    // Fs = 25 Hz
+    let mut heart = heart.into_heart_rate().unwrap();
+    heart
+        .set_sample_averaging(max3010x::SampleAveraging::Sa16)
+        .unwrap();
+    heart
+        .set_sampling_rate(max3010x::SamplingRate::Sps400)
+        .unwrap();
+    heart.set_pulse_amplitude(max3010x::Led::Led1, 35).unwrap();
+    heart
+        .set_pulse_width(max3010x::LedPulseWidth::Pw411)
+        .unwrap();
+    heart.enable_fifo_rollover().unwrap();
+    heart.clear_fifo().unwrap();
+    let mut data = [0; 1];
+    let interval = Duration::from_micros(10_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
+
+    log::info!("Starting heart rate sensing...");
+
+    loop {
+        let now = std::time::Instant::now();
+
+        match heart.read_fifo(&mut data) {
+            Ok(samples_read) if samples_read > 0 => {
+                let sample = data[0] as f32;
+                {
+                    samples.lock().unwrap().add(data[0] as f32);
+                }
+                if status.lock().unwrap().connected {
+                    match udp_socket
+                        .lock()
+                        .unwrap()
+                        .send(&bincode::serialize(&Packet::RawHeartRate(sample)).unwrap())
+                    {
+                        Ok(_) => (),
+                        Err(e) => {
+                            log::warn!("Error sending data: {:?}", e);
+                            continue;
+                        }
+                    }
+                }
+            }
+            Ok(_) => (),
+            Err(e) => log::warn!("Error reading FIFO: {:?}", e),
+        }
+
+        std::thread::sleep(interval.checked_sub(now.elapsed()).unwrap_or_default());
+    }
+}
+
+fn status_log_thread(udp_socket: Arc<Mutex<UdpSocket>>, status: Arc<Mutex<Status>>) {
+    loop {
+        thread::sleep(std::time::Duration::from_secs(1));
+        let status = status.lock().unwrap();
+        if status.connected {
+            let status_bytes = bincode::serialize(&Packet::Status(status.clone())).unwrap();
             match udp_socket.lock().unwrap().send(&status_bytes) {
                 Ok(_) => {}
                 Err(e) => log::warn!("Error sending status: {:?}", e),
             }
-        });
-    }
-
-    let mut i = 0;
-
-    let mut data = [0; 1];
-    let mut samples = Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0);
-    let mut heart_data_bytes = [0_u8; (MAX30102_NUM_SAMPLES + 1) * 4];
-    let mut heart_data = pulse_sensor::Max3012SampleData::new();
-
-    heart.clear_fifo().unwrap();
-
-    block_on(async {
-        loop {
-            board
-                .timer
-                .delay(board.timer.tick_hz() / MAX30102_SAMPLE_RATE.0 as u64)
-                .await?;
-
-            let samples_read = heart.read_fifo(&mut data).unwrap() as usize;
-
-            if samples_read > 0 {
-                samples.add(data[0] as f32);
-            }
-
-            if i >= MAX30102_NUM_SAMPLES {
-                i = 0;
-                heart_data.update_from_samples(&samples.data);
-                log::info!("Heart rate: {:?}", heart_data.heart_rate_bpm);
-
-                heart_data_bytes[0..4]
-                    .copy_from_slice(&heart_data.heart_rate_bpm.unwrap_or(0.0).to_le_bytes());
-                for (i, x) in heart_data.ac.iter().enumerate() {
-                    heart_data_bytes[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&x.to_le_bytes());
-                }
-
-                match udp_socket.lock().unwrap().send(&heart_data_bytes) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        log::warn!("Error sending data: {:?}", e);
-                        continue;
-                    }
-                }
-            }
-            i += 1;
         }
-    })
+    }
 }
 
-fn eth_reconnect_task(eth: Arc<Mutex<Option<EthPeripheral>>>, ip_info: Arc<Mutex<Option<IpInfo>>>) {
+fn eth_reconnect_task(
+    eth: Arc<Mutex<Option<EthPeripheral>>>,
+    ip_info: Arc<Mutex<Option<IpInfo>>>,
+    status: Arc<Mutex<Status>>,
+) {
     let mut error_count = 0;
     loop {
         thread::sleep(std::time::Duration::from_secs(5));
@@ -235,12 +304,16 @@ fn eth_reconnect_task(eth: Arc<Mutex<Option<EthPeripheral>>>, ip_info: Arc<Mutex
                         let mut ip_info = ip_info.lock().unwrap();
                         *ip_info = Some(ip);
                         error_count = 0;
+                        status.lock().unwrap().connected = true;
                     }
                     Err(e) => {
                         if error_count < 3 {
                             error_count += 1;
                             log::warn!("Error connecting eth: {:?}", e);
                         }
+                        let mut ip_info = ip_info.lock().unwrap();
+                        *ip_info = None;
+                        status.lock().unwrap().connected = false;
                     }
                 }
             }

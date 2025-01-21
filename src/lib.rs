@@ -1,5 +1,5 @@
 #![feature(type_alias_impl_trait)]
-use std::{cell::RefCell, sync::Arc};
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use display_interface_spi::SPIInterface;
@@ -26,7 +26,7 @@ use mipidsi::{
 };
 
 pub struct Board<'d> {
-    pub i2c_driver: RefCell<i2c::I2cDriver<'d>>,
+    pub i2c_driver: Mutex<i2c::I2cDriver<'d>>,
     pub spi_driver: Option<Arc<spi::SpiDriver<'d>>>,
     // pub adc_driver: Option<adc::oneshot::AdcChannelDriver<'d>>,
     pub eth_driver: Option<EthPeripheral<'d>>,
@@ -109,7 +109,7 @@ impl<'d> Board<'d> {
         Board {
             sys_loop,
             timer_service,
-            i2c_driver,
+            i2c_driver: Mutex::new(i2c_driver),
             spi_driver,
             // adc_driver,
             eth_driver,
@@ -127,14 +127,14 @@ impl<'d> Board<'d> {
         i2c: impl Peripheral<P = I2C> + 'd,
         sda: impl Peripheral<P = impl InputPin + OutputPin> + 'd,
         scl: impl Peripheral<P = impl InputPin + OutputPin> + 'd,
-    ) -> anyhow::Result<RefCell<i2c::I2cDriver<'d>>> {
+    ) -> anyhow::Result<i2c::I2cDriver<'d>> {
         log::info!("Initializing I2C...");
-        let res = Ok(RefCell::new(i2c::I2cDriver::new(
+        let res = Ok(i2c::I2cDriver::new(
             i2c,
             sda,
             scl,
             &i2c::config::Config::new().baudrate(400.kHz().into()),
-        )?));
+        )?);
         log::info!("I2C initialized");
         res
     }
