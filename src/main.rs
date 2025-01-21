@@ -178,7 +178,7 @@ fn main() -> Result<()> {
     std::thread::sleep(Duration::from_millis(400));
 
     loop {
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(10));
         {
             let samples = samples.lock().unwrap();
 
@@ -191,7 +191,7 @@ fn main() -> Result<()> {
             );
         }
 
-        if heart_data_channel.heartbeats.len() > 6 {
+        if heart_data_channel.heartbeats.len() > 2 {
             let new_bpm = heart_data_channel.heart_rate_bpm.unwrap();
             if new_bpm > 40.0 && new_bpm < 200.0 {
                 *bpm.lock().unwrap() = new_bpm;
@@ -238,7 +238,7 @@ fn heart_sensing_task(
     heart.enable_fifo_rollover().unwrap();
     heart.clear_fifo().unwrap();
     let mut data = [0; 1];
-    let interval = Duration::from_micros(10_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
+    let interval = Duration::from_micros(1_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
 
     log::info!("Starting heart rate sensing...");
 
