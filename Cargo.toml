@@ -38,6 +38,7 @@ max3010x = "0.2.0"
 embedded-hal-bus = "0.2.0"
 embedded-hal = "1.0.0"
 bitfield = "0.17.0"
+heapless = "0.8.0"
 
 [build-dependencies]
 embuild = "0.33.0"

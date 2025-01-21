@@ -1,200 +1,107 @@
-#[derive(Debug)]
-pub struct PulseSensor {
-    /// holds raw Analog in 0. updated every call to read_sensor()
-    bpm: u16,
-    /// holds the latest incoming raw data (0..4095)
-    signal: u32,
-    /// holds the time interval (ms) between beats! Must be seeded!
-    ibi: u16,
-    /// "true" when User's live heartbeat is detected. "false" when not a "live beat".
-    pulse: bool,
-    /// The start of beat has been detected and not read by the Sketch.
-    qs: bool,
-    /// used to seed and reset the thresh variable
-    thresh_setting: u32,
-    /// used to hold amplitude of pulse waveform, seeded (sample value)
-    amp: u32,
-    /// used to find IBI. Time (sample_counter) of the previous detected beat start.
-    last_beat_time: u32,
+use esp_idf_svc::hal::units::Hertz;
+use heapless::{binary_heap::Max, BinaryHeap, Vec};
 
-    /// expected time between calls to read_sensor(), in milliseconds.
-    sample_interval_ms: u32,
-    /// array to hold last ten IBI values (ms)
-    rate: [u16; 10],
-    /// used to determine pulse timing. Milliseconds since we started.
-    sample_counter: u32,
-    /// used to monitor duration between beats
-    n: u16,
-    /// used to find peak in pulse wave, seeded (sample value)
-    p: u32,
-    /// used to find trough in pulse wave, seeded (sample value)
-    t: u32,
-    /// used to find instant moment of heart beat, seeded (sample value)
-    thresh: u32,
-    /// used to seed rate array so we startup with reasonable BPM
-    first_beat: bool,
-    /// used to seed rate array so we startup with reasonable BPM
-    second_beat: bool,
+use crate::{
+    linreg::Linreg,
+    signal::{Heartbeat, HeartbeatItr},
+};
 
-    adc_range: u32,
+pub const MAX30102_NUM_SAMPLES: usize = 100;
+pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
+
+pub struct Max3012SampleData {
+    /// "AC" component of R/IR signal sample
+    /// (sensor value - DC mean subtracted)
+    pub ac: [f32; MAX30102_NUM_SAMPLES],
+
+    /// "DC" mean of the sample
+    dc_mean: f32,
+
+    /// for scale, to display raw data
+    pub ac_max: f32,
+    pub ac_min: f32,
+
+    linreg: Linreg<MAX30102_NUM_SAMPLES>,
+
+    pub heartbeats: Vec<Heartbeat, 16>,
+
+    pub heart_rate_bpm: Option<f32>,
 }
 
-impl PulseSensor {
-    // Constructs a PulseSensor manager using a default configuration.
-    pub fn new(adc_range_bits: u8) -> Self {
-        let adc_range = (1_u32 << adc_range_bits) - 1;
-        Self {
-            bpm: 0,
-            signal: 0,
-            ibi: 750, // 750ms per beat = 80 Beats Per Minute (BPM)
-            pulse: false,
-            qs: false,
-            thresh_setting: adc_range / 10 * 6,
-            amp: adc_range / 10, // beat amplitude 1/10 of input range.
-            last_beat_time: 0,
-            sample_interval_ms: 2, // 500 Hz
-            rate: [0; 10],
-            sample_counter: 0,
-            n: 0,
-            p: adc_range / 2, // peak at 1/2 the input range of 0..1023
-            t: adc_range / 2, // trough at 1/2 the input range.
-            thresh: adc_range / 10 * 6,
-            first_beat: true,   // looking for the first beat
-            second_beat: false, // not yet looking for the second beat in a row
-            adc_range,
+impl Max3012SampleData {
+    pub fn new() -> Self {
+        Max3012SampleData {
+            ac: [0.0; MAX30102_NUM_SAMPLES],
+            dc_mean: 0.0,
+
+            ac_max: 1.0,
+            ac_min: 0.0,
+
+            linreg: Linreg::new(),
+
+            heartbeats: Vec::new(),
+
+            heart_rate_bpm: None,
         }
     }
 
-    // sets variables to default start values
-    pub fn reset_variables(&mut self) {
-        self.qs = false;
-        self.bpm = 0;
-        self.ibi = 750;
-        self.pulse = false;
-        self.sample_counter = 0;
-        self.last_beat_time = 0;
-        self.p = self.adc_range / 2;
-        self.t = self.adc_range / 2;
-        self.thresh = self.thresh_setting;
-        self.amp = self.adc_range / 10;
-        self.first_beat = true;
-        self.second_beat = false;
-    }
+    pub fn update_from_samples(&mut self, data: &[f32; MAX30102_NUM_SAMPLES]) {
+        self.dc_mean = 0.0;
+        self.ac_max = f32::MIN;
+        self.ac_min = f32::MAX;
 
-    // Returns the sample most recently-read from this PulseSensor.
-    // pub fn get_latest_sample(&self) -> u16 {
-    //     self.signal
-    // }
+        for (i, x) in data.iter().enumerate() {
+            self.ac[i] = *x;
+            self.dc_mean += x;
+        }
+        self.dc_mean /= MAX30102_NUM_SAMPLES as f32;
 
-    // Returns the latest beats-per-minute measurement on this PulseSensor.
-    pub fn get_beats_per_minute(&self) -> u16 {
-        self.bpm
-    }
+        for ac in self.ac.iter_mut() {
+            *ac -= self.dc_mean;
+        }
 
-    // Returns the latest inter-beat interval (milliseconds) on this PulseSensor.
-    pub fn get_inter_beat_interval_ms(&self) -> u16 {
-        self.ibi
-    }
+        self.linreg.update_from(&self.ac);
 
-    // Reads and clears the 'saw start of beat' flag, "QS".
-    pub fn saw_start_of_beat(&mut self) -> bool {
-        let ret = self.qs;
-        self.qs = false;
-        ret
-    }
+        for (i, ac) in self.ac.iter_mut().enumerate() {
+            *ac -= self.linreg.y(i as f32);
+            self.ac_max = self.ac_max.max(*ac);
+            self.ac_min = self.ac_min.min(*ac);
+        }
 
-    // // Returns true if this PulseSensor signal is inside a beat vs. outside.
-    // pub fn is_inside_beat(&self) -> bool {
-    //     self.pulse
-    // }
+        self.heartbeats.clear();
 
-    // // Returns the latest amp value.
-    // pub fn get_pulse_amplitude(&self) -> u16 {
-    //     self.amp
-    // }
+        // Keep track of distances (in array indexes) between heartbeats
+        let mut hb_dist: BinaryHeap<usize, Max, 16> = BinaryHeap::new();
+        let mut last_hb_idx: Option<usize> = None;
+        let hb_threshold = (self.ac_max - self.ac_min) / 4.0;
+        for hb in HeartbeatItr::new(&self.ac) {
+            // Ignore small amplitude "wiggles", focus on larger transitions.
+            // This only works if overall signal is clean enough from motion
+            // artifacts (i.e. actual heartbeats stay relatively close to
+            // min/max amplitude values).
+            let hb_val_diff = hb.high_value - hb.low_value;
 
-    // Returns the sample number of the most recent detected pulse.
-    pub fn get_last_beat_time(&self) -> u32 {
-        self.last_beat_time
-    }
+            if hb_val_diff > hb_threshold {
+                let _ = self.heartbeats.push(hb);
+                for lhb in last_hb_idx {
+                    let _ = hb_dist.push(hb.high_idx - lhb);
+                }
 
-    // (internal to the library) Read a sample from this PulseSensor.
-    pub fn read_next_sample(&mut self, sample: u32) {
-        self.signal = sample;
-    }
-
-    // (internal to the library) Process the latest sample.
-    pub fn process_latest_sample(&mut self) {
-        self.sample_counter += self.sample_interval_ms; // keep track of the time in mS with this variable
-        self.n = (self.sample_counter - self.last_beat_time) as u16; // monitor the time since the last beat to avoid noise
-
-        //  find the peak and trough of the pulse wave
-        if self.signal < self.thresh && self.n > (self.ibi / 5) * 3 {
-            // avoid dichrotic noise by waiting 3/5 of last IBI
-            if self.signal < self.t {
-                // T is the trough
-                self.t = self.signal; // keep track of lowest point in pulse wave
+                last_hb_idx = Some(hb.high_idx);
             }
         }
 
-        if self.signal > self.thresh && self.signal > self.p {
-            // thresh condition helps avoid noise
-            self.p = self.signal // P is the peak
-        } // keep track of highest point in pulse wave
+        self.heart_rate_bpm = None;
 
-        if self.n > 250 {
-            // avoid high frequency noise
-            if self.signal > self.thresh && !self.pulse && self.n > (self.ibi / 5) * 3 {
-                self.pulse = true; // set the pulse flag when we think there is a pulse
-                self.ibi = self.n; // measure time between beats in mS
-                self.last_beat_time = self.sample_counter; // keep track of time for next pulse
+        if !hb_dist.is_empty() {
+            // ignore extremes, pick a value in the middle
+            for _ in 0..(hb_dist.len() / 2) {
+                hb_dist.pop();
+            }
 
-                if self.second_beat {
-                    // if this is the second beat, if second_beat == TRUE
-                    self.second_beat = false; // clear second beat flag
-                    for i in 0..10 {
-                        // seed the running total to get a realisitic BPM at startup
-                        self.rate[i] = self.ibi;
-                    }
-                }
-
-                if self.first_beat {
-                    self.first_beat = false; // clear first beat flag
-                    self.second_beat = true; // set the second beat flag
-                    return;
-                }
-
-                // keep a running total of the last 10 IBI values
-                for i in 0..9 {
-                    self.rate[i] = self.rate[i + 1];
-                }
-                self.rate[9] = self.ibi; // add the latest IBI to the rate array
-
-                // average the last 10 IBI values
-                let running_total = self.rate.iter().sum::<u16>() / 10;
-                self.bpm = 60_000 / running_total; // how many beats can fit into a minute? that's BPM!
-                self.qs = true; // set the Quantified Self flag
+            for hbd in hb_dist.pop() {
+                self.heart_rate_bpm = Some(60.0 * MAX30102_SAMPLE_RATE.0 as f32 / hbd as f32);
             }
         }
-
-        if self.signal < self.thresh && self.pulse {
-            // when the beat goes below the threshold, the beat is over
-            self.pulse = false; // reset the pulse flag so we can do it again
-            self.amp = self.p - self.t; // get amplitude of the pulse wave
-            self.thresh = (self.p + self.t) / 2; // get the average of the peak and trough
-            self.p = self.thresh; // reset the peak
-            self.t = self.thresh; // reset the trough
-        }
-
-        if self.n > 2500 {
-            // if 2.5 seconds go by without a beat
-            self.reset_variables();
-        }
     }
-
-    // (internal to the library) Update the thresh variables.
-    // fn set_threshold(&mut self, threshold: u16) {
-    //     self.thresh_setting = threshold;
-    //     self.thresh = threshold;
-    // }
 }

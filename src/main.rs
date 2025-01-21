@@ -1,3 +1,4 @@
+use std::future::IntoFuture;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -5,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use circ::Circ;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 
 use esp_idf_svc::ipv4::IpInfo;
@@ -15,19 +17,20 @@ use embedded_hal_bus::i2c as i2c_bus;
 use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 
 use esp_pulser::*;
+use pulse_sensor::{MAX30102_NUM_SAMPLES, MAX30102_SAMPLE_RATE};
+mod circ;
 mod drv2605;
+mod linreg;
 mod ota;
 mod pulse_sensor;
-
-const SAMPLING_RATE_HZ: u64 = 1000;
-const SAMPLES_PER_PACKET: usize = 200;
+mod signal;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, serde::Serialize)]
 struct Status {
     version: [u8; 3],
-    ip_info: Option<IpInfo>,
+    connected: bool,
     display_ok: bool,
     haptic_ok: bool,
     heart_ok: bool,
@@ -41,7 +44,7 @@ impl Status {
         }
         Self {
             version,
-            ip_info: None,
+            connected: false,
             display_ok: false,
             haptic_ok: false,
             heart_ok: false,
@@ -67,70 +70,36 @@ fn main() -> Result<()> {
 
     status.display_ok = board.display_driver.is_some();
 
-    status.ip_info = match &mut board.eth_driver {
-        Some(ref mut eth) => connect_eth(eth).ok(),
-        None => None,
-    };
-
+    let ip_info = Arc::new(Mutex::new(None));
     let eth = Arc::new(Mutex::new(board.eth_driver));
 
-    thread::spawn(move || {
+    {
         let eth = eth.clone();
-        let mut error_count = 0;
-        loop {
-            thread::sleep(std::time::Duration::from_secs(5));
-            let mut eth = eth.lock().unwrap();
-
-            if let Some(ref mut eth) = *eth {
-                if let Ok(false) = eth.is_connected() {
-                    if let Err(e) = connect_eth(eth) {
-                        if error_count < 3 {
-                            error_count += 1;
-                            log::warn!("Error connecting eth: {:?}", e);
-                        }
-                    } else {
-                        error_count = 0;
-                    }
-                }
-            }
-        }
-    });
-
-    let mut samples = [0u8; 4 * (SAMPLES_PER_PACKET + 2)];
+        let ip_info = ip_info.clone();
+        thread::spawn(move || eth_reconnect_task(eth, ip_info));
+    }
 
     let mut haptic = drv2605::Drv2605::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
     haptic.set_overdrive_time_offset(20)?;
     haptic.calibrate(255)?;
     haptic.init_open_loop_erm()?;
     haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
-    // status.haptic_ok = haptic
-    //     .init_open_loop_erm()
-    //     .and_then(|_| haptic.set_single_effect(Effect::StrongBuzz100))
-    //     .is_ok();
 
     let heart = Max3010x::new_max30102(i2c_bus::RefCellDevice::new(&board.i2c_driver));
 
-    // Fs = 31.25 Hz
+    // Fs = 25 Hz
     let mut heart = heart.into_heart_rate().unwrap();
     heart
-        .set_sample_averaging(max3010x::SampleAveraging::Sa32)
+        .set_sample_averaging(max3010x::SampleAveraging::Sa16)
         .unwrap();
     heart
-        .set_sampling_rate(max3010x::SamplingRate::Sps1000)
+        .set_sampling_rate(max3010x::SamplingRate::Sps400)
         .unwrap();
-    heart.set_pulse_amplitude(max3010x::Led::Led1, 15).unwrap();
+    heart.set_pulse_amplitude(max3010x::Led::Led1, 35).unwrap();
     heart
         .set_pulse_width(max3010x::LedPulseWidth::Pw411)
         .unwrap();
     heart.enable_fifo_rollover().unwrap();
-    // status.heart_ok = heart
-    //     .set_sample_averaging(max3010x::SampleAveraging::Sa4)
-    //     .and_then(|_| heart.enable_fifo_rollover())
-    //     .and_then(|_| heart.set_pulse_amplitude(max3010x::Led::All, 200))
-    //     .and_then(|_| heart.set_pulse_width(max3010x::LedPulseWidth::Pw411))
-    //     .is_ok();
-    // let mut heart =
-    //     dfrobot_max30102::DFRobotBloodOxygenS::new(i2c_bus::RefCellDevice::new(&board.i2c_driver));
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
@@ -221,7 +190,8 @@ fn main() -> Result<()> {
 
     if board.display_driver.is_some() {
         let mut display = board.display_driver.unwrap();
-        if status.ip_info.is_none() {
+        let ip_info = ip_info.lock().unwrap();
+        if ip_info.is_none() {
             display
                 .clear(Rgb565::RED)
                 .map_err(|_| anyhow!("clear display"))?;
@@ -235,7 +205,7 @@ fn main() -> Result<()> {
                 .map_err(|_| anyhow!("clear display"))?;
 
             get_styled_text(
-                &["Connected", &status.ip_info.unwrap().ip.to_string()].join("\n"),
+                &["Connected", &ip_info.unwrap().ip.to_string()].join("\n"),
                 100,
                 50,
             )
@@ -261,10 +231,12 @@ fn main() -> Result<()> {
         });
     }
 
-    let mut pulse_sensor = pulse_sensor::PulseSensor::new(18);
-    let mut i = 8;
+    let mut i = 0;
 
-    let mut data = [0; 3];
+    let mut data = [0; 1];
+    let mut samples = Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0);
+    let mut heart_data_bytes = [0_u8; (MAX30102_NUM_SAMPLES + 1) * 4];
+    let mut heart_data = pulse_sensor::Max3012SampleData::new();
 
     heart.clear_fifo().unwrap();
 
@@ -272,34 +244,27 @@ fn main() -> Result<()> {
         loop {
             board
                 .timer
-                .delay(board.timer.tick_hz() / SAMPLING_RATE_HZ)
+                .delay(board.timer.tick_hz() / MAX30102_SAMPLE_RATE.0 as u64)
                 .await?;
 
             let samples_read = heart.read_fifo(&mut data).unwrap() as usize;
 
-            // let signal = adc.read_raw()?;
-
-            if pulse_sensor.saw_start_of_beat() {
-                haptic.set_go(true)?;
+            if samples_read > 0 {
+                samples.add(data[0] as f32);
             }
 
-            for signal in data.iter().take(samples_read) {
-                pulse_sensor.read_next_sample(*signal);
-                pulse_sensor.process_latest_sample();
-                if i < samples.len() {
-                    samples[i..i + 4].copy_from_slice(&signal.to_be_bytes());
-                    i += 4;
+            if i >= MAX30102_NUM_SAMPLES {
+                i = 0;
+                heart_data.update_from_samples(&samples.data);
+                log::info!("Heart rate: {:?}", heart_data.heart_rate_bpm);
+
+                heart_data_bytes[0..4]
+                    .copy_from_slice(&heart_data.heart_rate_bpm.unwrap_or(0.0).to_le_bytes());
+                for (i, x) in heart_data.ac.iter().enumerate() {
+                    heart_data_bytes[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&x.to_le_bytes());
                 }
-            }
 
-            if i >= samples.len() {
-                i = 8;
-                samples[0..4]
-                    .copy_from_slice(&(pulse_sensor.get_beats_per_minute() as u32).to_be_bytes());
-                samples[4..8].copy_from_slice(
-                    &(pulse_sensor.get_inter_beat_interval_ms() as u32).to_be_bytes(),
-                );
-                match udp_socket.lock().unwrap().send(&samples) {
+                match udp_socket.lock().unwrap().send(&heart_data_bytes) {
                     Ok(_) => (),
                     Err(e) => {
                         log::warn!("Error sending data: {:?}", e);
@@ -307,8 +272,35 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            i += 1;
         }
     })
+}
+
+fn eth_reconnect_task(eth: Arc<Mutex<Option<EthPeripheral>>>, ip_info: Arc<Mutex<Option<IpInfo>>>) {
+    let mut error_count = 0;
+    loop {
+        thread::sleep(std::time::Duration::from_secs(5));
+        let mut eth = eth.lock().unwrap();
+
+        if let Some(ref mut eth) = *eth {
+            if let Ok(false) = eth.is_connected() {
+                match connect_eth(eth) {
+                    Ok(ip) => {
+                        let mut ip_info = ip_info.lock().unwrap();
+                        *ip_info = Some(ip);
+                        error_count = 0;
+                    }
+                    Err(e) => {
+                        if error_count < 3 {
+                            error_count += 1;
+                            log::warn!("Error connecting eth: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn get_styled_text(text: &str, x: i32, y: i32) -> Text<'_, MonoTextStyle<Rgb565>> {

@@ -29,7 +29,7 @@ pub struct Board<'d> {
     pub i2c_driver: RefCell<i2c::I2cDriver<'d>>,
     pub spi_driver: Option<Arc<spi::SpiDriver<'d>>>,
     // pub adc_driver: Option<adc::oneshot::AdcChannelDriver<'d>>,
-    pub eth_driver: Option<AsyncEth<EspEth<'d, SpiEth<Arc<spi::SpiDriver<'d>>>>>>,
+    pub eth_driver: Option<EthPeripheral<'d>>,
     pub display_driver: Option<TftDisplay<'d>>,
     pub sys_loop: EspSystemEventLoop,
     pub timer_service: EspTaskTimerService,
@@ -41,6 +41,7 @@ pub struct Board<'d> {
     _i2c_power: I2CPowerPin<'d>,
 }
 
+pub type EthPeripheral<'d> = AsyncEth<EspEth<'d, SpiEth<Arc<spi::SpiDriver<'d>>>>>;
 pub type BtnPin0<'d> = PinDriver<'d, impl InputPin, Input>;
 pub type BtnPin1<'d> = PinDriver<'d, impl InputPin, Input>;
 pub type BtnPin2<'d> = PinDriver<'d, impl InputPin, Input>;
