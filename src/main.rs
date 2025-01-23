@@ -105,6 +105,10 @@ fn main() -> Result<()> {
     haptic.init_open_loop_erm()?;
     haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
 
+    {
+        status.lock().unwrap().haptic_ok = true;
+    }
+
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
         3333,
@@ -270,6 +274,10 @@ fn heart_sensing_task(
     heart.clear_fifo().unwrap();
     let mut data = [0; 1];
     let interval = Duration::from_micros(1_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
+
+    {
+        status.lock().unwrap().heart_ok = true;
+    }
 
     log::info!("Starting heart rate sensing...");
 
