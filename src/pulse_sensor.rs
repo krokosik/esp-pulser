@@ -6,7 +6,7 @@ use crate::{
     signal::{Heartbeat, HeartbeatItr},
 };
 
-pub const MAX30102_NUM_SAMPLES: usize = 100;
+pub const MAX30102_NUM_SAMPLES: usize = 200;
 pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
 
 pub struct Max3012SampleData {
@@ -15,7 +15,7 @@ pub struct Max3012SampleData {
     pub ac: [f32; MAX30102_NUM_SAMPLES],
 
     /// "DC" mean of the sample
-    dc_mean: f32,
+    pub dc_mean: f32,
 
     /// for scale, to display raw data
     pub ac_max: f32,
@@ -45,15 +45,18 @@ impl Max3012SampleData {
         }
     }
 
-    pub fn update_from_samples(&mut self, data: &[f32; MAX30102_NUM_SAMPLES]) {
+    pub fn update_from_samples(&mut self, data: impl Iterator<Item = f32>) {
         self.dc_mean = 0.0;
         self.ac_max = f32::MIN;
         self.ac_min = f32::MAX;
 
-        for (i, x) in data.iter().enumerate() {
-            self.ac[i] = *x;
+        for (i, x) in data.enumerate() {
+            self.ac[i] = x;
             self.dc_mean += x;
         }
+    }
+
+    pub fn process_signal(&mut self) {
         self.dc_mean /= MAX30102_NUM_SAMPLES as f32;
 
         for ac in self.ac.iter_mut() {

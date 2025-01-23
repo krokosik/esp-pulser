@@ -58,6 +58,7 @@ enum Packet {
     Status(Status),
     RawHeartRate(f32),
     Bpm(f32),
+    HeartRate(f32),
 }
 
 fn main() -> Result<()> {
@@ -94,7 +95,6 @@ fn main() -> Result<()> {
 
     let i2c_device_clone = i2c_device.clone();
     let mut haptic = drv2605::Drv2605::new(MutexDevice::new(&i2c_device_clone));
-    haptic.set_overdrive_time_offset(20)?;
     haptic.calibrate(CalibrationParams {
         brake_factor: 2,
         loop_gain: 2,
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         rated_voltage: 234,
     })?;
     haptic.init_open_loop_erm()?;
-    haptic.set_single_effect(drv2605::Effect::SharpTickOne100)?;
+    haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::new(0, 0, 0, 0),
@@ -163,6 +163,7 @@ fn main() -> Result<()> {
 
     let samples = Arc::new(Mutex::new(Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0)));
     let mut heart_data_channel = pulse_sensor::Max3012SampleData::new();
+    let data_to_send = Arc::new(Mutex::new(0));
     let bpm = Arc::new(Mutex::new(0.0));
 
     {
@@ -170,36 +171,65 @@ fn main() -> Result<()> {
         let udp_socket = udp_socket.clone();
         let i2c_device = i2c_device.clone();
         let status = status.clone();
-        thread::Builder::new()
-            .stack_size(4 * 1024)
-            .spawn(move || heart_sensing_task(samples, udp_socket, i2c_device, status))?;
+        let data_to_send = data_to_send.clone();
+        thread::Builder::new().stack_size(4 * 1024).spawn(move || {
+            heart_sensing_task(samples, udp_socket, i2c_device, status, data_to_send)
+        })?;
     }
 
     std::thread::sleep(Duration::from_millis(400));
+
+    let mut beat_triggered = false;
 
     loop {
         std::thread::sleep(Duration::from_millis(10));
         {
             let samples = samples.lock().unwrap();
 
-            heart_data_channel.update_from_samples(
-                &samples
-                    .into_iter()
-                    .collect::<Vec<f32>>()
-                    .try_into()
-                    .unwrap(),
-            );
+            heart_data_channel.update_from_samples(samples.iter());
         }
 
-        if heart_data_channel.heartbeats.len() > 2 {
+        heart_data_channel.process_signal();
+
+        {
+            let mut data_to_send = data_to_send.lock().unwrap();
+            if *data_to_send > 0 {
+                *data_to_send = 0;
+                if status.lock().unwrap().connected {
+                    match udp_socket.lock().unwrap().send(
+                        &bincode::serialize(&Packet::HeartRate(
+                            heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1],
+                        ))
+                        .unwrap(),
+                    ) {
+                        Ok(_) => (),
+                        Err(e) => log::warn!("Error sending data: {:?}", e),
+                    };
+                }
+            }
+        }
+
+        if heart_data_channel.heartbeats.len() > 4 && heart_data_channel.dc_mean > 100_000.0 {
             let new_bpm = heart_data_channel.heart_rate_bpm.unwrap();
             if new_bpm > 40.0 && new_bpm < 200.0 {
+                let last_heartbeat_idx =
+                    heart_data_channel.heartbeats[heart_data_channel.heartbeats.len() - 1].low_idx;
+
+                if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 10 {
+                    if !beat_triggered {
+                        beat_triggered = true;
+                        haptic.set_go(true)?;
+                    }
+                } else {
+                    beat_triggered = false;
+                }
                 *bpm.lock().unwrap() = new_bpm;
             } else {
                 *bpm.lock().unwrap() = 0.0;
             }
         } else {
             *bpm.lock().unwrap() = 0.0;
+            beat_triggered = false;
         }
 
         if status.lock().unwrap().connected {
@@ -220,6 +250,7 @@ fn heart_sensing_task(
     udp_socket: Arc<Mutex<UdpSocket>>,
     i2c_device: Arc<Mutex<I2cDriver>>,
     status: Arc<Mutex<Status>>,
+    data_to_send: Arc<Mutex<u8>>,
 ) {
     let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
 
@@ -248,6 +279,9 @@ fn heart_sensing_task(
         match heart.read_fifo(&mut data) {
             Ok(samples_read) if samples_read > 0 => {
                 let sample = data[0] as f32;
+                {
+                    *data_to_send.lock().unwrap() = 1;
+                }
                 {
                     samples.lock().unwrap().add(data[0] as f32);
                 }
