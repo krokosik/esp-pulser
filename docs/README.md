@@ -1,77 +1,33 @@
 # esp_pulser
 
+## Description
+
+This is the firmware for an ESP32-S3 MCU responsible for collecting heartbeat data using an MAX30102 sensor. It is meant to be used with the companion [GUI app](https://github.com/krokosik/esp-pulser-gui).
+
+### Features
+
+- collecting heartbeat with 25 Hz sampling rate and 16 values of sample averaging
+- signal processing with an algorithm
+    - designed by @aromring for STM32 https://github.com/aromring/MAX30102_by_RF
+    - ported to Rust by @andreyk0 https://github.com/andreyk0/cardiac-monitor
+- haptic motor, controlled with the DRV2605L driver, triggered on heartbeat detection
+- ethernet connectivity via the W5500 SPI chip, with automatic reconnection mechanism
+- display for showing the status and assigned IP address (WIP)
+    - the display is off by default to limit power consumption
+    - enable it by holding the D2 button
+- TCP listener socket for accepting remote commands from the GUI companion app
+- UDP streaming of raw and processed heartbeat data, calculated bpm and device status
+- OTA update functionality using the companion app
+
 ## Dev Containers
-This repository offers Dev Containers supports for:
--  [VS Code Dev Containers](https://code.visualstudio.com/docs/remote/containers#_quick-start-open-an-existing-folder-in-a-container)
--  [GitHub Codespaces](https://docs.github.com/en/codespaces/developing-in-codespaces/creating-a-codespace)
-> **Note**
->
-> In [order to use GitHub Codespaces](https://github.com/features/codespaces#faq)
-> the project needs to be published in a GitHub repository and the user needs
-> to be part of the Codespaces beta or have the project under an organization.
+This repository offers Dev Containers supports for [VS Code Dev Containers](https://code.visualstudio.com/docs/remote/containers#_quick-start-open-an-existing-folder-in-a-container) and it is the recommended way of developing the code. There are a lot of build dependencies that are guaranteed to work inside of it. The linked website has all the necessary information for setting it up on your machine. The only additional requirement is flashing via [USBIP](https://github.com/dorssel/usbipd-win). Note that the device has to be attached to the WSL integration before the container is launched, as it is impossible to attach a device while it is already running.
 
-If using VS Code or GitHub Codespaces, you can pull the image instead of building it
-from the Dockerfile by selecting the `image` property instead of `build` in
-`.devcontainer/devcontainer.json`. Further customization of the Dev Container can
-be achived, see [.devcontainer.json reference](https://code.visualstudio.com/docs/remote/devcontainerjson-reference).
+Once the container is up, before flashing you also need to give permissions to access the usb port. The container is run without root privileges, so from the host shell, one needs to run:
+```
+docker exec -it -u 0 <CONTAINER_NAME> chmod a+rw /dev/ttyACM0
+```
 
-When using Dev Containers, some tooling to facilitate building, flashing and
-simulating in Wokwi is also added.
-### Build
-- Terminal approach:
-
-    ```
-    scripts/build.sh  [debug | release]
-    ```
-    > If no argument is passed, `release` will be used as default
-
-
--  UI approach:
-
-    The default build task is already set to build the project, and it can be used
-    in VS Code and GitHub Codespaces:
-    - From the [Command Palette](https://code.visualstudio.com/docs/getstarted/userinterface#_command-palette) (`Ctrl-Shift-P` or `Cmd-Shift-P`) run the `Tasks: Run Build Task` command.
-    - `Terminal`-> `Run Build Task` in the menu.
-    - With `Ctrl-Shift-B` or `Cmd-Shift-B`.
-    - From the [Command Palette](https://code.visualstudio.com/docs/getstarted/userinterface#_command-palette) (`Ctrl-Shift-P` or `Cmd-Shift-P`) run the `Tasks: Run Task` command and
-    select `Build`.
-    - From UI: Press `Build` on the left side of the Status Bar.
-
-### Flash
-
-> **Note**
->
-> When using GitHub Codespaces, we need to make the ports
-> public, [see instructions](https://docs.github.com/en/codespaces/developing-in-codespaces/forwarding-ports-in-your-codespace#sharing-a-port).
-
-- Terminal approach:
-  - Using `flash.sh` script:
-
-    ```
-    scripts/flash.sh [debug | release]
-    ```
-    > If no argument is passed, `release` will be used as default
-
-- UI approach:
-    - From the [Command Palette](https://code.visualstudio.com/docs/getstarted/userinterface#_command-palette) (`Ctrl-Shift-P` or `Cmd-Shift-P`) run the `Tasks: Run Task` command and
-    select `Build & Flash`.
-    - From UI: Press `Build & Flash` on the left side of the Status Bar.
-- Any alternative flashing method from host machine.
-
-
-### Wokwi Simulation
-
-#### VS Code Dev Containers and GitHub Codespaces
-
-The Dev Container includes the Wokwi Vs Code installed, hence you can simulate your built projects doing the following:
-1. Press `F1`
-2. Run `Wokwi: Start Simulator`
-
-> **Note**
->
->  We assume that the project is built in `debug` mode, if you want to simulate projects in release, please update the `elf` and  `firmware` proprieties in `wokwi.toml`.
-
-For more information and details on how to use the Wokwi extension, see [Getting Started] and [Debugging your code] Chapter of the Wokwi documentation.
-
-[Getting Started]: https://docs.wokwi.com/vscode/getting-started
-[Debugging your code]: https://docs.wokwi.com/vscode/debugging
+Once that is done, `cargo` can be used for:
+- building `cargo build [--release]`
+- flashing with log monitor `cargo run`
+- other espflash functionalities [docs](https://github.com/esp-rs/espflash/tree/main/cargo-espflash) 
