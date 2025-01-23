@@ -25,19 +25,22 @@ jobs:
           buildtargets: esp32s3
           ldproxy: true
 
-      - name: Install espflash
-        run: sudo apt install libudev-dev && cargo install cargo-espflash
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install esptool
+        run: pip install esptool
 
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-all-crates: true
 
       - name: Build
         run: cargo build --release
 
       - name: Trim binary
-        run: cargo espflash save-image --chip esp32s3 -s 4mb --partition-table partitions.csv target/xtensa-esp32s3-espidf/release/esp-pulser
+        run: esptool.py --chip esp32s3 elf2image --flash_size 4MB --output esp-pulser target/xtensa-esp32s3-espidf/release/esp-pulser
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -59,7 +62,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: target/xtensa-esp32s3-espidf/release/esp-pulser
+          asset_path: esp-pulser
           asset_name: esp-pulser
           asset_content_type: application/x-dosexec
 
