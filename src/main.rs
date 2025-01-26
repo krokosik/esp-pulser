@@ -9,7 +9,6 @@ use anyhow::{anyhow, Result};
 use circ::Circ;
 use drv2605::CalibrationParams;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
-
 use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::ipv4::IpInfo;
 use http::Uri;
@@ -168,7 +167,6 @@ fn main() -> Result<()> {
     let samples = Arc::new(Mutex::new(Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0)));
     let mut heart_data_channel = pulse_sensor::Max3012SampleData::new();
     let data_to_send = Arc::new(Mutex::new(0));
-    let bpm = Arc::new(Mutex::new(0.0));
 
     {
         let samples = samples.clone();
@@ -213,35 +211,28 @@ fn main() -> Result<()> {
             }
         }
 
-        if heart_data_channel.heartbeats.len() > 4 && heart_data_channel.dc_mean > 100_000.0 {
-            let new_bpm = heart_data_channel.heart_rate_bpm.unwrap();
-            if new_bpm > 40.0 && new_bpm < 200.0 {
-                let last_heartbeat_idx =
-                    heart_data_channel.heartbeats[heart_data_channel.heartbeats.len() - 1].low_idx;
+        if let Some(last_heartbeat) = heart_data_channel.heartbeats.last() {
+            let last_heartbeat_idx = last_heartbeat.low_idx;
 
-                if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 10 {
-                    if !beat_triggered {
-                        beat_triggered = true;
-                        haptic.set_go(true)?;
-                    }
-                } else {
-                    beat_triggered = false;
+            if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 10 {
+                if !beat_triggered {
+                    beat_triggered = true;
+                    haptic.set_go(true)?;
                 }
-                *bpm.lock().unwrap() = new_bpm;
             } else {
-                *bpm.lock().unwrap() = 0.0;
+                beat_triggered = false;
             }
         } else {
-            *bpm.lock().unwrap() = 0.0;
             beat_triggered = false;
         }
 
         if status.lock().unwrap().connected {
-            match udp_socket
-                .lock()
-                .unwrap()
-                .send(&bincode::serialize(&Packet::Bpm(*bpm.lock().unwrap())).unwrap())
-            {
+            match udp_socket.lock().unwrap().send(
+                &bincode::serialize(&Packet::Bpm(
+                    heart_data_channel.heart_rate_bpm.unwrap_or_default(),
+                ))
+                .unwrap(),
+            ) {
                 Ok(_) => (),
                 Err(e) => log::warn!("Error sending data: {:?}", e),
             };
@@ -255,23 +246,31 @@ fn heart_sensing_task(
     i2c_device: Arc<Mutex<I2cDriver>>,
     status: Arc<Mutex<Status>>,
     data_to_send: Arc<Mutex<u8>>,
-) {
+) -> anyhow::Result<()> {
     let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
 
     // Fs = 25 Hz
-    let mut heart = heart.into_heart_rate().unwrap();
+    let mut heart = heart
+        .into_heart_rate()
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
         .set_sample_averaging(max3010x::SampleAveraging::Sa16)
-        .unwrap();
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
         .set_sampling_rate(max3010x::SamplingRate::Sps400)
-        .unwrap();
-    heart.set_pulse_amplitude(max3010x::Led::Led1, 35).unwrap();
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+    heart
+        .set_pulse_amplitude(max3010x::Led::Led1, 35)
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
         .set_pulse_width(max3010x::LedPulseWidth::Pw411)
-        .unwrap();
-    heart.enable_fifo_rollover().unwrap();
-    heart.clear_fifo().unwrap();
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+    heart
+        .enable_fifo_rollover()
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+    heart
+        .clear_fifo()
+        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     let mut data = [0; 1];
     let interval = Duration::from_micros(1_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
 
@@ -308,7 +307,7 @@ fn heart_sensing_task(
                 }
             }
             Ok(_) => (),
-            Err(e) => log::warn!("Error reading FIFO: {:?}", e),
+            Err(e) => log::error!("Error reading FIFO: {:?}", e),
         }
 
         std::thread::sleep(interval.checked_sub(now.elapsed()).unwrap_or_default());

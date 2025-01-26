@@ -96,14 +96,13 @@ impl Max3012SampleData {
 
         self.heart_rate_bpm = None;
 
-        if !hb_dist.is_empty() {
-            // ignore extremes, pick a value in the middle
-            for _ in 0..(hb_dist.len() / 2) {
-                hb_dist.pop();
-            }
+        if hb_dist.len() > 4 && self.dc_mean > 100_000.0 {
+            let mean_hb_dist = hb_dist.iter().sum::<usize>() as f32 / hb_dist.len() as f32;
 
-            if let Some(hbd) = hb_dist.pop() {
-                self.heart_rate_bpm = Some(60.0 * MAX30102_SAMPLE_RATE.0 as f32 / hbd as f32);
+            let bpm = 60.0 * MAX30102_SAMPLE_RATE.0 as f32 / mean_hb_dist;
+
+            if bpm < 200.0 && bpm > 40.0 {
+                self.heart_rate_bpm = Some(bpm);
             }
         }
     }
