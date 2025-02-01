@@ -29,6 +29,7 @@ jobs:
         with:
           python-version: '3.13'
           cache: 'pip'
+          cache-dependency-path: scripts/gen_esp32part.py # dummy as we only install a global package
 
       - name: Install esptool
         run: pip install esptool
