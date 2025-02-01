@@ -42,6 +42,12 @@ jobs:
       - name: Trim binary
         run: esptool.py --chip esp32s3 elf2image --flash_size 4MB --output esp-pulser target/xtensa-esp32s3-espidf/release/esp-pulser
 
+      - name: Create merged binary for full flash
+        run: |
+          python scripts/gen_esp32part.py partitions.csv partition-table.bin
+          cp target/xtensa-esp32s3-espidf/release/bootloader.bin .
+          esptool.py --chip esp32s3 merge_bin -o esp-pulser-merged.bin --flash_mode dio --flash_size 4MB 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 esp-pulser
+
       - name: Get version from Cargo.toml
         id: get_version
         run: echo "VERSION=$(grep '^version =' Cargo.toml | sed -E 's/version = \"([^\"]+)\"/\1/')" >> $GITHUB_ENV
@@ -64,6 +70,15 @@ jobs:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: esp-pulser
           asset_name: esp-pulser
+          asset_content_type: application/x-dosexec
+
+      - uses: actions/upload-release-asset@v1.0.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: esp-pulser-merged.bin
+          asset_name: esp-pulser-merged.bin
           asset_content_type: application/x-dosexec
 
       - uses: eregon/publish-release@v1
