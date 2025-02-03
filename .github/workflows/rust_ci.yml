@@ -25,14 +25,11 @@ jobs:
           buildtargets: esp32s3
           ldproxy: true
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-          cache: 'pip'
-          cache-dependency-path: scripts/gen_esp32part.py # dummy as we only install a global package
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@v1.10.22
 
-      - name: Install esptool
-        run: pip install esptool
+      - name: Install espflash
+        run: cargo binstall -y espflash
 
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
@@ -41,13 +38,7 @@ jobs:
         run: cargo build --release
 
       - name: Trim binary
-        run: esptool.py --chip esp32s3 elf2image --flash_size 4MB --output esp-pulser target/xtensa-esp32s3-espidf/release/esp-pulser
-
-      - name: Create merged binary for full flash
-        run: |
-          python scripts/gen_esp32part.py partitions.csv partition-table.bin
-          cp target/xtensa-esp32s3-espidf/release/bootloader.bin .
-          esptool.py --chip esp32s3 merge_bin -o esp-pulser-merged.bin --flash_mode dio --flash_size 4MB 0x1000 bootloader.bin 0x8000 partition-table.bin 0x10000 esp-pulser
+        run: espflash save-image --chip esp32s3 target/xtensa-esp32s3-espidf/release/esp-pulser esp-pulser
 
       - name: Get version from Cargo.toml
         id: get_version
@@ -78,8 +69,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: esp-pulser-merged.bin
-          asset_name: esp-pulser-merged.bin
+          asset_path: partitions.csv
+          asset_name: partitions.csv
           asset_content_type: application/x-dosexec
 
       - uses: eregon/publish-release@v1
