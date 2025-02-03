@@ -93,19 +93,23 @@ fn main() -> Result<()> {
     }
 
     let i2c_device_clone = i2c_device.clone();
-    let mut haptic = drv2605::Drv2605::new(MutexDevice::new(&i2c_device_clone));
-    haptic.calibrate(CalibrationParams {
-        brake_factor: 2,
-        loop_gain: 2,
-        auto_cal_time: 4,
-        overdrive_clamp_voltage: 255,
-        rated_voltage: 234,
-    })?;
-    haptic.init_open_loop_erm()?;
-    haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
+    let mut haptic = (|| {
+        let mut haptic = drv2605::Drv2605::new(MutexDevice::new(&i2c_device_clone));
+        haptic.calibrate(CalibrationParams {
+            brake_factor: 2,
+            loop_gain: 2,
+            auto_cal_time: 4,
+            overdrive_clamp_voltage: 255,
+            rated_voltage: 234,
+        })?;
+        haptic.init_open_loop_erm()?;
+        haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
+        anyhow::Ok(haptic)
+    })()
+    .ok();
 
     {
-        status.lock().unwrap().haptic_ok = true;
+        status.lock().unwrap().haptic_ok = haptic.is_some();
     }
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
@@ -198,7 +202,9 @@ fn main() -> Result<()> {
             if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 10 {
                 if !beat_triggered {
                     beat_triggered = true;
-                    haptic.set_go(true)?;
+                    if let Some(haptic) = haptic.as_mut() {
+                        haptic.set_go(true)?;
+                    }
                 }
             } else {
                 beat_triggered = false;
