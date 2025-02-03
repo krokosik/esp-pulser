@@ -14,8 +14,7 @@
   "runArgs": [
     "--mount",
     "type=bind,source=/run/udev,target=/run/udev,readonly",
-    "--device",
-    "/dev/ttyACM0"
+    "--privileged"
   ],
   "customizations": {
     "vscode": {
