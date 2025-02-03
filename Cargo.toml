@@ -37,7 +37,6 @@ http = "1.2.0"
 max3010x = "0.2.0"
 embedded-hal-bus = { features = ["std"], version="0.2.0" }
 embedded-hal = "1.0.0"
-bitfield = "0.17.0"
 heapless = "0.8.0"
 drv2605 = { git = "https://github.com/krokosik/drv2605.git", version = "0.2.0" }
 
