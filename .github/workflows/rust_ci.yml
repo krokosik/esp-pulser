@@ -43,10 +43,6 @@ jobs:
       - name: Trim binary
         run: espflash save-image --chip esp32s3 target/xtensa-esp32s3-espidf/release/esp-pulser esp-pulser
 
-      - name: Get version from Cargo.toml
-        id: get_version
-        run: echo "VERSION=$(grep '^version =' Cargo.toml | sed -E 's/version = \"([^\"]+)\"/\1/')" >> $GITHUB_ENV
-
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
