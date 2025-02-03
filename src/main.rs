@@ -58,6 +58,7 @@ enum Packet {
     RawHeartRate(f32),
     Bpm(f32),
     HeartRate(f32),
+    // Debug((f32, f32, f32)),
 }
 
 fn main() -> Result<()> {
@@ -193,6 +194,16 @@ fn main() -> Result<()> {
                     status.clone(),
                     &Packet::HeartRate(heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1]),
                 );
+                let samples = samples.lock().unwrap();
+                // send_via_udp(
+                //     udp_socket.clone(),
+                //     status.clone(),
+                //     &Packet::Debug((
+                //         samples.iter().last().unwrap_or_default(),
+                //         heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1],
+                //         heart_data_channel.heart_rate_bpm.unwrap_or_default(),
+                //     )),
+                // );
             }
         }
 
@@ -294,6 +305,7 @@ fn status_log_thread(
     ip_info: Arc<Mutex<Option<IpInfo>>>,
 ) {
     let mut displayed_ip_info = None::<IpInfo>;
+    let mut first = true;
 
     loop {
         thread::sleep(std::time::Duration::from_secs(1));
@@ -306,7 +318,7 @@ fn status_log_thread(
 
         if display_driver.as_ref().is_some() {
             let ip_info = ip_info.lock().unwrap();
-            if *ip_info != displayed_ip_info {
+            if first || *ip_info != displayed_ip_info {
                 displayed_ip_info = *ip_info;
             } else {
                 continue;
@@ -315,6 +327,7 @@ fn status_log_thread(
             let display = display_driver.as_mut().unwrap();
 
             if let Some(displayed_ip_info) = displayed_ip_info {
+                first = false;
                 display.clear(Rgb565::GREEN).unwrap();
 
                 get_styled_text(

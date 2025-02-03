@@ -17,6 +17,10 @@ pub struct Max3012SampleData {
     /// "DC" mean of the sample
     pub dc_mean: f32,
 
+    /// Number of samples to skip from the beginning of the data
+    /// (to ignore initial "junk" movement data)
+    pub data_to_skip: usize,
+
     /// for scale, to display raw data
     pub ac_max: f32,
     pub ac_min: f32,
@@ -33,6 +37,7 @@ impl Max3012SampleData {
         Max3012SampleData {
             ac: [0.0; MAX30102_NUM_SAMPLES],
             dc_mean: 0.0,
+            data_to_skip: 0,
 
             ac_max: 1.0,
             ac_min: 0.0,
@@ -50,17 +55,35 @@ impl Max3012SampleData {
         self.ac_max = f32::MIN;
         self.ac_min = f32::MAX;
 
-        for (i, x) in data.enumerate() {
-            self.ac[i] = x;
-            self.dc_mean += x;
-        }
+        self.data_to_skip = data
+            .enumerate()
+            .fold((0, None::<f32>), |(res, prev), (i, x)| {
+                self.ac[i] = x;
+                if let Some(prev) = prev {
+                    if (x - prev).abs() > 100_000.0 {
+                        (i + 1, None)
+                    } else {
+                        (res, Some(x))
+                    }
+                } else {
+                    (res, Some(x))
+                }
+            })
+            .0;
     }
 
     pub fn process_signal(&mut self) {
-        self.dc_mean /= MAX30102_NUM_SAMPLES as f32;
+        for ac in self.ac.iter().skip(self.data_to_skip) {
+            self.dc_mean += ac;
+        }
+        self.dc_mean /= (MAX30102_NUM_SAMPLES - self.data_to_skip) as f32;
 
-        for ac in self.ac.iter_mut() {
-            *ac -= self.dc_mean;
+        for (i, ac) in self.ac.iter_mut().enumerate() {
+            if i < self.data_to_skip {
+                *ac = 0.0;
+            } else {
+                *ac -= self.dc_mean;
+            }
         }
 
         self.linreg.update_from(&self.ac);
