@@ -131,37 +131,14 @@ fn main() -> Result<()> {
         })
     });
 
-    if board.display_driver.is_some() {
-        let mut display = board.display_driver.unwrap();
-        let ip_info = ip_info.lock().unwrap();
-        if ip_info.is_none() {
-            display
-                .clear(Rgb565::RED)
-                .map_err(|_| anyhow!("clear display"))?;
-
-            get_styled_text("Unconnected", 100, 50)
-                .draw(&mut display)
-                .map_err(|_| anyhow!("draw text"))?;
-        } else {
-            display
-                .clear(Rgb565::GREEN)
-                .map_err(|_| anyhow!("clear display"))?;
-
-            get_styled_text(
-                &["Connected", &ip_info.unwrap().ip.to_string()].join("\n"),
-                100,
-                50,
-            )
-            .draw(&mut display)
-            .map_err(|_| anyhow!("draw text"))?;
-        }
-    }
-
     {
         let udp_socket = udp_socket.clone();
         let status = status.clone();
+        let ip_info = ip_info.clone();
 
-        thread::spawn(move || status_log_thread(udp_socket, status));
+        thread::Builder::new()
+            .stack_size(8 * 1024)
+            .spawn(move || status_log_thread(udp_socket, board.display_driver, status, ip_info))?;
     }
 
     let samples = Arc::new(Mutex::new(Circ::<f32, MAX30102_NUM_SAMPLES>::new(0.0)));
@@ -175,7 +152,17 @@ fn main() -> Result<()> {
         let status = status.clone();
         let data_to_send = data_to_send.clone();
         thread::Builder::new().stack_size(4 * 1024).spawn(move || {
-            heart_sensing_task(samples, udp_socket, i2c_device, status, data_to_send)
+            match heart_sensing_task(
+                samples,
+                udp_socket,
+                i2c_device,
+                status.clone(),
+                data_to_send,
+            ) {
+                Ok(_) => (),
+                Err(e) => log::error!("Error in heart sensing task: {:?}", e),
+            }
+            status.lock().unwrap().heart_ok = false;
         })?;
     }
 
@@ -197,17 +184,11 @@ fn main() -> Result<()> {
             let mut data_to_send = data_to_send.lock().unwrap();
             if *data_to_send > 0 {
                 *data_to_send = 0;
-                if status.lock().unwrap().connected {
-                    match udp_socket.lock().unwrap().send(
-                        &bincode::serialize(&Packet::HeartRate(
-                            heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1],
-                        ))
-                        .unwrap(),
-                    ) {
-                        Ok(_) => (),
-                        Err(e) => log::warn!("Error sending data: {:?}", e),
-                    };
-                }
+                send_via_udp(
+                    udp_socket.clone(),
+                    status.clone(),
+                    &Packet::HeartRate(heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1]),
+                );
             }
         }
 
@@ -226,17 +207,11 @@ fn main() -> Result<()> {
             beat_triggered = false;
         }
 
-        if status.lock().unwrap().connected {
-            match udp_socket.lock().unwrap().send(
-                &bincode::serialize(&Packet::Bpm(
-                    heart_data_channel.heart_rate_bpm.unwrap_or_default(),
-                ))
-                .unwrap(),
-            ) {
-                Ok(_) => (),
-                Err(e) => log::warn!("Error sending data: {:?}", e),
-            };
-        }
+        send_via_udp(
+            udp_socket.clone(),
+            status.clone(),
+            &Packet::Bpm(heart_data_channel.heart_rate_bpm.unwrap_or_default()),
+        );
     }
 }
 
@@ -292,19 +267,11 @@ fn heart_sensing_task(
                 {
                     samples.lock().unwrap().add(data[0] as f32);
                 }
-                if status.lock().unwrap().connected {
-                    match udp_socket
-                        .lock()
-                        .unwrap()
-                        .send(&bincode::serialize(&Packet::RawHeartRate(sample)).unwrap())
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            log::warn!("Error sending data: {:?}", e);
-                            continue;
-                        }
-                    }
-                }
+                send_via_udp(
+                    udp_socket.clone(),
+                    status.clone(),
+                    &Packet::RawHeartRate(sample),
+                );
             }
             Ok(_) => (),
             Err(e) => log::error!("Error reading FIFO: {:?}", e),
@@ -314,16 +281,53 @@ fn heart_sensing_task(
     }
 }
 
-fn status_log_thread(udp_socket: Arc<Mutex<UdpSocket>>, status: Arc<Mutex<Status>>) {
+fn status_log_thread(
+    udp_socket: Arc<Mutex<UdpSocket>>,
+    mut display_driver: Option<TftDisplay<'_>>,
+    status: Arc<Mutex<Status>>,
+    ip_info: Arc<Mutex<Option<IpInfo>>>,
+) {
+    let mut displayed_ip_info = None::<IpInfo>;
+
     loop {
         thread::sleep(std::time::Duration::from_secs(1));
-        let status = status.lock().unwrap();
-        if status.connected {
-            let status_bytes = bincode::serialize(&Packet::Status(status.clone())).unwrap();
-            match udp_socket.lock().unwrap().send(&status_bytes) {
-                Ok(_) => {}
-                Err(e) => log::warn!("Error sending status: {:?}", e),
+        let status_clone = status.lock().unwrap().clone();
+        send_via_udp(
+            udp_socket.clone(),
+            status.clone(),
+            &Packet::Status(status_clone),
+        );
+
+        if display_driver.as_ref().is_some() {
+            let ip_info = ip_info.lock().unwrap();
+            if *ip_info != displayed_ip_info {
+                displayed_ip_info = *ip_info;
+            } else {
+                continue;
             }
+
+            let display = display_driver.as_mut().unwrap();
+
+            if let Some(displayed_ip_info) = displayed_ip_info {
+                display.clear(Rgb565::GREEN).unwrap();
+
+                get_styled_text(
+                    &["Connected", &displayed_ip_info.ip.to_string()].join("\n"),
+                    100,
+                    50,
+                )
+                .draw(display)
+                .unwrap();
+            } else {
+                display.clear(Rgb565::RED).unwrap();
+
+                get_styled_text("Unconnected", 100, 50)
+                    .draw(display)
+                    .unwrap();
+            }
+        } else {
+            log::warn!("Display driver not initialized");
+            status.lock().unwrap().display_ok = false;
         }
     }
 }
@@ -420,6 +424,19 @@ fn tcp_receiver_task(udp_socket: Arc<Mutex<UdpSocket>>) {
                 log::warn!("Error accepting connection: {:?}", e);
             }
         }
+    }
+}
+
+fn send_via_udp(udp_socket: Arc<Mutex<UdpSocket>>, status: Arc<Mutex<Status>>, packet: &Packet) {
+    if status.lock().unwrap().connected {
+        match udp_socket
+            .lock()
+            .unwrap()
+            .send(&bincode::serialize(packet).unwrap())
+        {
+            Ok(_) => (),
+            Err(e) => log::warn!("Error sending data: {:?}", e),
+        };
     }
 }
 
