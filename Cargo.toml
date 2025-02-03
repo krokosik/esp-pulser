@@ -1,7 +1,7 @@
 [package]
 name = "esp-pulser"
 version = "0.4.6"
-authors = ["krokosik <wikkra@gmail.com>"]
+authors = ["krokosik <krokosik@pm.me>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
