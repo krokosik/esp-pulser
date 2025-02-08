@@ -40,13 +40,17 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Trim binary
-        run: espflash save-image --chip esp32s3 target/xtensa-esp32s3-espidf/release/esp-pulser esp-pulser
+      - name: Copy compiled ELF file
+        run: cp target/xtensa-esp32s3-espidf/release/esp-pulser .
+
+      - name: Trim OTA binary
+        run: espflash save-image --chip esp32s3 esp-pulser esp-pulser-ota
 
       - name: Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
+            esp-pulser-ota
             esp-pulser
             partitions.csv
