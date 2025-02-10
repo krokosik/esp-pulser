@@ -1,5 +1,9 @@
 # esp_pulser
 
+## Breaking change warning
+
+OTA for versions lower than 0.5.0 does not work, due to filename change. Updating needs to be done with manual flashing.
+
 ## Description
 
 This is the firmware for an ESP32-S3 MCU responsible for collecting heartbeat data using an MAX30102 sensor. It is meant to be used with the companion [GUI app](https://github.com/krokosik/esp-pulser-gui).
