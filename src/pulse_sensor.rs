@@ -70,6 +70,9 @@ impl Max3012SampleData {
                 }
             })
             .0;
+
+        // temporarily disable cutoff
+        self.data_to_skip = 0;
     }
 
     pub fn process_signal(&mut self) {
