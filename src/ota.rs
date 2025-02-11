@@ -8,7 +8,7 @@ use esp_idf_svc::sys::{ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE};
 use http::{header::ACCEPT, Uri};
 
 pub const UPDATE_BIN_URL: &str =
-    "https://github.com/krokosik/esp-pulser/releases/download/vTAG/esp-pulser-ota";
+    "https://github.com/krokosik/esp-pulser/releases/download/vTAG/esp-pulser";
 
 const FIRMWARE_DOWNLOAD_CHUNK_SIZE: usize = 1024 * 20;
 // Not expect firmware bigger than partition size
