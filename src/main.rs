@@ -11,6 +11,7 @@ use drv2605::CalibrationParams;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::ipv4::IpInfo;
+use esp_idf_svc::nvs::*;
 use http::Uri;
 use max3010x::Max3010x;
 
@@ -34,6 +35,7 @@ struct Status {
     display_ok: bool,
     haptic_ok: bool,
     heart_ok: bool,
+    led_amplitude: u8,
 }
 
 impl Status {
@@ -48,6 +50,7 @@ impl Status {
             display_ok: false,
             haptic_ok: false,
             heart_ok: false,
+            led_amplitude: 0,
         }
     }
 }
@@ -69,7 +72,13 @@ fn main() -> Result<()> {
     // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    let nvs_default_partition: EspNvsPartition<NvsDefault> = EspDefaultNvsPartition::take()?;
+    let nvs = EspNvs::new(nvs_default_partition, "heart_sensor", true)?;
+
     let mut status = Status::new();
+
+    let led_amplitude = nvs.get_u8("led_amplitude")?.unwrap_or(35);
+    status.led_amplitude = led_amplitude;
 
     let peripherals = Peripherals::take()?;
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
@@ -120,9 +129,10 @@ fn main() -> Result<()> {
 
     {
         let udp_socket = udp_socket.clone();
+        let status = status.clone();
         thread::Builder::new()
             .stack_size(8 * 1024)
-            .spawn(move || tcp_receiver_task(udp_socket))?;
+            .spawn(move || tcp_receiver_task(udp_socket, status, nvs))?;
     }
 
     thread::spawn(move || {
@@ -194,7 +204,7 @@ fn main() -> Result<()> {
                     status.clone(),
                     &Packet::HeartRate(heart_data_channel.ac[MAX30102_NUM_SAMPLES - 1]),
                 );
-                let samples = samples.lock().unwrap();
+                // let samples = samples.lock().unwrap();
                 // send_via_udp(
                 //     udp_socket.clone(),
                 //     status.clone(),
@@ -242,6 +252,11 @@ fn heart_sensing_task(
     data_to_send: Arc<Mutex<u8>>,
 ) -> anyhow::Result<()> {
     let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
+    let mut led_amplitude;
+
+    {
+        led_amplitude = status.lock().unwrap().led_amplitude;
+    }
 
     // Fs = 25 Hz
     let mut heart = heart
@@ -254,7 +269,7 @@ fn heart_sensing_task(
         .set_sampling_rate(max3010x::SamplingRate::Sps400)
         .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
-        .set_pulse_amplitude(max3010x::Led::Led1, 35)
+        .set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)
         .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
         .set_pulse_width(max3010x::LedPulseWidth::Pw411)
@@ -265,7 +280,7 @@ fn heart_sensing_task(
     heart
         .clear_fifo()
         .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    let mut data = [0; 1];
+    let mut data = [0; 10];
     let interval = Duration::from_micros(1_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
 
     {
@@ -294,6 +309,16 @@ fn heart_sensing_task(
             }
             Ok(_) => (),
             Err(e) => log::error!("Error reading FIFO: {:?}", e),
+        }
+
+        {
+            let status = status.lock().unwrap();
+            if status.led_amplitude != led_amplitude {
+                led_amplitude = status.led_amplitude;
+                heart
+                    .set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)
+                    .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+            }
         }
 
         std::thread::sleep(interval.checked_sub(now.elapsed()).unwrap_or_default());
@@ -387,7 +412,11 @@ fn eth_reconnect_task(
     }
 }
 
-fn tcp_receiver_task(udp_socket: Arc<Mutex<UdpSocket>>) {
+fn tcp_receiver_task(
+    udp_socket: Arc<Mutex<UdpSocket>>,
+    status: Arc<Mutex<Status>>,
+    nvs: EspNvs<NvsDefault>,
+) {
     let tcp_socket =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 12345)).unwrap();
 
@@ -404,12 +433,6 @@ fn tcp_receiver_task(udp_socket: Arc<Mutex<UdpSocket>>) {
                         Ok(0) => {
                             log::info!("Connection closed");
                             break;
-                        }
-                        Ok(2) => {
-                            let port = u16::from_be_bytes([buf[0], buf[1]]);
-                            let udp_target = SocketAddr::new(addr.ip(), port);
-                            log::info!("Connecting to UDP socket at: {}", udp_target);
-                            udp_socket.lock().unwrap().connect(udp_target).unwrap();
                         }
                         Ok(n) => {
                             log::info!("Received TCP command: {:?}", buf[0]);
@@ -428,6 +451,18 @@ fn tcp_receiver_task(udp_socket: Arc<Mutex<UdpSocket>>) {
                                         log::warn!("Invalid URL to download firmware");
                                     }
                                     restart();
+                                }
+                                2 => {
+                                    let led_amplitude = buf[1];
+                                    log::info!("Setting LED amplitude to: {}", led_amplitude);
+                                    status.lock().unwrap().led_amplitude = led_amplitude;
+                                    nvs.set_u8("led_amplitude", led_amplitude).unwrap();
+                                }
+                                3 => {
+                                    let port = u16::from_be_bytes([buf[1], buf[2]]);
+                                    let udp_target = SocketAddr::new(addr.ip(), port);
+                                    log::info!("Connecting to UDP socket at: {}", udp_target);
+                                    udp_socket.lock().unwrap().connect(udp_target).unwrap();
                                 }
                                 _ => {
                                     log::info!("Unknown command");
