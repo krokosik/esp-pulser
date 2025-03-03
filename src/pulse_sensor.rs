@@ -1,5 +1,6 @@
 use esp_idf_svc::hal::units::Hertz;
 use heapless::{binary_heap::Max, BinaryHeap, Vec};
+use std::cmp::min;
 
 use crate::{
     linreg::Linreg,
@@ -25,7 +26,7 @@ pub struct Max3012SampleData {
     pub ac_max: f32,
     pub ac_min: f32,
 
-    linreg: Linreg<MAX30102_NUM_SAMPLES>,
+    linreg: Linreg,
 
     pub heartbeats: Vec<Heartbeat, 16>,
 
@@ -42,7 +43,7 @@ impl Max3012SampleData {
             ac_max: 1.0,
             ac_min: 0.0,
 
-            linreg: Linreg::new(),
+            linreg: Linreg::new(MAX30102_NUM_SAMPLES),
 
             heartbeats: Vec::new(),
 
@@ -51,10 +52,6 @@ impl Max3012SampleData {
     }
 
     pub fn update_from_samples(&mut self, data: impl Iterator<Item = f32>) {
-        self.dc_mean = 0.0;
-        self.ac_max = f32::MIN;
-        self.ac_min = f32::MAX;
-
         self.data_to_skip = data
             .enumerate()
             .fold((0, None::<f32>), |(res, prev), (i, x)| {
@@ -71,30 +68,31 @@ impl Max3012SampleData {
             })
             .0;
 
-        // temporarily disable cutoff
-        self.data_to_skip = 0;
+        self.data_to_skip = min(
+            if self.data_to_skip > 0 {
+                self.data_to_skip + 50
+            } else {
+                self.data_to_skip
+            },
+            MAX30102_NUM_SAMPLES,
+        );
     }
 
     pub fn process_signal(&mut self) {
-        for ac in self.ac.iter().skip(self.data_to_skip) {
-            self.dc_mean += ac;
-        }
-        self.dc_mean /= (MAX30102_NUM_SAMPLES - self.data_to_skip) as f32;
+        self.dc_mean = 0.0;
+        self.ac_max = f32::MIN;
+        self.ac_min = f32::MAX;
+
+        self.linreg.update_from(&self.ac[self.data_to_skip..]);
 
         for (i, ac) in self.ac.iter_mut().enumerate() {
             if i < self.data_to_skip {
                 *ac = 0.0;
             } else {
-                *ac -= self.dc_mean;
+                *ac -= self.linreg.y(i as f32);
+                self.ac_max = self.ac_max.max(*ac);
+                self.ac_min = self.ac_min.min(*ac);
             }
-        }
-
-        self.linreg.update_from(&self.ac);
-
-        for (i, ac) in self.ac.iter_mut().enumerate() {
-            *ac -= self.linreg.y(i as f32);
-            self.ac_max = self.ac_max.max(*ac);
-            self.ac_min = self.ac_min.min(*ac);
         }
 
         self.heartbeats.clear();
@@ -122,12 +120,12 @@ impl Max3012SampleData {
 
         self.heart_rate_bpm = None;
 
-        if hb_dist.len() > 4 && self.dc_mean > 100_000.0 {
+        if hb_dist.len() > 3 && self.linreg.intercept > 100_000.0 {
             let mean_hb_dist = hb_dist.iter().sum::<usize>() as f32 / hb_dist.len() as f32;
 
             let bpm = 60.0 * MAX30102_SAMPLE_RATE.0 as f32 / mean_hb_dist;
 
-            if bpm < 200.0 && bpm > 40.0 {
+            if bpm < 180.0 && bpm > 60.0 {
                 self.heart_rate_bpm = Some(bpm);
             }
         }

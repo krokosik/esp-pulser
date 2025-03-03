@@ -1,6 +1,8 @@
-pub struct Linreg<const NUM_SAMPLES: usize> {
+pub struct Linreg {
     pub intercept: f32,
     pub slope: f32,
+
+    n: usize,
 
     // a few constants that depend on the array size
     sumx: f32,
@@ -8,23 +10,31 @@ pub struct Linreg<const NUM_SAMPLES: usize> {
     sumx_sq: f32,
 }
 
-impl<const NUM_SAMPLES: usize> Linreg<NUM_SAMPLES> {
-    pub fn new() -> Self {
-        let sumx = ((NUM_SAMPLES - 1) * NUM_SAMPLES) as f32 / 2.0;
+impl Linreg {
+    pub fn new(n: usize) -> Self {
+        let sumx = ((n - 1) * n) as f32 / 2.0;
+        let sum_xsq = (0..n).map(|x| x as f32 * x as f32).sum();
         Linreg {
             intercept: 0.0,
             slope: 1.0,
+            n,
             sumx,
-            sum_xsq: (0..NUM_SAMPLES).map(|x| x as f32 * x as f32).sum(),
+            sum_xsq,
             sumx_sq: sumx * sumx,
         }
+    }
+
+    fn update_constants(&mut self) {
+        self.sumx = ((self.n - 1) * self.n) as f32 / 2.0;
+        self.sum_xsq = (0..self.n).map(|x| x as f32 * x as f32).sum();
+        self.sumx_sq = self.sumx * self.sumx;
     }
 
     pub fn y(&self, x: f32) -> f32 {
         self.intercept + self.slope * x
     }
 
-    pub fn update_from(&mut self, data: &[f32; NUM_SAMPLES]) {
+    pub fn update_from(&mut self, data: &[f32]) {
         let mut sum_y = 0.0;
         let mut sum_xy = 0.0;
 
@@ -33,7 +43,18 @@ impl<const NUM_SAMPLES: usize> Linreg<NUM_SAMPLES> {
             sum_xy += x * i as f32;
         }
 
-        let n = NUM_SAMPLES as f32;
+        let n = data.len();
+        if n == 0 {
+            self.intercept = 0.0;
+            self.slope = 1.0;
+            return;
+        }
+        if n != self.n {
+            self.n = n;
+            self.update_constants();
+        }
+
+        let n = self.n as f32;
         self.intercept =
             (sum_y * self.sum_xsq - self.sumx * sum_xy) / (n * self.sum_xsq - self.sumx_sq);
 
@@ -47,7 +68,7 @@ mod tests {
 
     #[test]
     fn test0() {
-        let mut lr = Linreg::<3>::new();
+        let mut lr = Linreg::new(3);
         lr.update_from(&[0.0, 0.0, 0.0]);
 
         assert_eq!(lr.intercept, 0.0);
@@ -58,7 +79,7 @@ mod tests {
 
     #[test]
     fn test_0_45() {
-        let mut lr = Linreg::<3>::new();
+        let mut lr = Linreg::new(n);
         lr.update_from(&[0.0, 1.0, 2.0]);
         assert_eq!(lr.intercept, 0.0);
         assert_eq!(lr.slope, 1.0);
@@ -67,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_1_45() {
-        let mut lr = Linreg::<3>::new();
+        let mut lr = Linreg::new(n);
         lr.update_from(&[1.0, 2.0, 3.0]);
 
         assert_eq!(lr.y(0.0), 1.0);

@@ -220,7 +220,7 @@ fn main() -> Result<()> {
         if let Some(last_heartbeat) = heart_data_channel.heartbeats.last() {
             let last_heartbeat_idx = last_heartbeat.low_idx;
 
-            if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 10
+            if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 12 // wait at least half a second (BPM 120)
                 && heart_data_channel.heart_rate_bpm.is_some()
             {
                 if !beat_triggered {
