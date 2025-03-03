@@ -8,7 +8,11 @@ use crate::{
 };
 
 pub const MAX30102_NUM_SAMPLES: usize = 200;
-pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
+pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(50);
+
+// const FIR_COEFFS: [u16; 12] = [
+//     172, 321, 579, 927, 1360, 1858, 2390, 2916, 3391, 3768, 4012, 4096,
+// ];
 
 pub struct Max3012SampleData {
     /// "AC" component of R/IR signal sample
@@ -120,7 +124,7 @@ impl Max3012SampleData {
 
         self.heart_rate_bpm = None;
 
-        if hb_dist.len() > 3 && self.linreg.intercept > 100_000.0 {
+        if hb_dist.len() > 2 && self.linreg.intercept > 100_000.0 {
             let mean_hb_dist = hb_dist.iter().sum::<usize>() as f32 / hb_dist.len() as f32;
 
             let bpm = 60.0 * MAX30102_SAMPLE_RATE.0 as f32 / mean_hb_dist;
@@ -130,4 +134,12 @@ impl Max3012SampleData {
             }
         }
     }
+
+    // fn low_pass_FIR_filter(&mut self, data: &[f32], filter: &[f32]) -> f32 {
+    //     let mut result = 0.0;
+    //     for (i, &f) in filter.iter().enumerate() {
+    //         result += f * data[i];
+    //     }
+    //     result
+    // }
 }

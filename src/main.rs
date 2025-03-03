@@ -220,7 +220,7 @@ fn main() -> Result<()> {
         if let Some(last_heartbeat) = heart_data_channel.heartbeats.last() {
             let last_heartbeat_idx = last_heartbeat.low_idx;
 
-            if last_heartbeat_idx > MAX30102_NUM_SAMPLES - 12 // wait at least half a second (BPM 120)
+            if last_heartbeat_idx > MAX30102_NUM_SAMPLES - (MAX30102_SAMPLE_RATE.0 / 2) as usize // wait at least half a second (BPM 120)
                 && heart_data_channel.heart_rate_bpm.is_some()
             {
                 if !beat_triggered {
@@ -266,7 +266,7 @@ fn heart_sensing_task(
         .set_sample_averaging(max3010x::SampleAveraging::Sa16)
         .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
-        .set_sampling_rate(max3010x::SamplingRate::Sps400)
+        .set_sampling_rate(max3010x::SamplingRate::Sps800)
         .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
     heart
         .set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)
