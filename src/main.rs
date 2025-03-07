@@ -258,35 +258,19 @@ fn heart_sensing_task(
     }
 
     // Fs = 25 Hz
-    let mut heart = heart
-        .into_multi_led()
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .set_led_time_slots([
-            max3010x::TimeSlot::Led3,
-            max3010x::TimeSlot::Disabled,
-            max3010x::TimeSlot::Disabled,
-            max3010x::TimeSlot::Disabled,
-        ])
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .set_sample_averaging(max3010x::SampleAveraging::Sa16)
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .set_sampling_rate(max3010x::SamplingRate::Sps800)
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .set_pulse_width(max3010x::LedPulseWidth::Pw411)
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .enable_fifo_rollover()
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
-    heart
-        .clear_fifo()
-        .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+    let mut heart = heart.into_multi_led()?;
+    heart.set_led_time_slots([
+        max3010x::TimeSlot::Led3,
+        max3010x::TimeSlot::Disabled,
+        max3010x::TimeSlot::Disabled,
+        max3010x::TimeSlot::Disabled,
+    ])?;
+    heart.set_sample_averaging(max3010x::SampleAveraging::Sa16)?;
+    heart.set_sampling_rate(max3010x::SamplingRate::Sps800)?;
+    heart.set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)?;
+    heart.set_pulse_width(max3010x::LedPulseWidth::Pw411)?;
+    heart.enable_fifo_rollover()?;
+    heart.clear_fifo()?;
     let mut data = [0; 10];
     let interval = Duration::from_micros(1_000_000 / MAX30102_SAMPLE_RATE.0 as u64);
 
