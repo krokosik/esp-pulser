@@ -7,8 +7,8 @@ use crate::{
     signal::{Heartbeat, HeartbeatItr},
 };
 
-pub const MAX30102_NUM_SAMPLES: usize = 200;
-pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(50);
+pub const MAX30102_NUM_SAMPLES: usize = 100;
+pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
 
 // const FIR_COEFFS: [u16; 12] = [
 //     172, 321, 579, 927, 1360, 1858, 2390, 2916, 3391, 3768, 4012, 4096,

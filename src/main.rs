@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use circ::Circ;
-use drv2605::CalibrationParams;
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
 use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::ipv4::IpInfo;
@@ -251,7 +250,7 @@ fn heart_sensing_task(
     status: Arc<Mutex<Status>>,
     data_to_send: Arc<Mutex<u8>>,
 ) -> anyhow::Result<()> {
-    let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
+    let heart = Max3010x::new_max30101(MutexDevice::new(&*i2c_device));
     let mut led_amplitude;
 
     {
@@ -316,7 +315,7 @@ fn heart_sensing_task(
             if status.led_amplitude != led_amplitude {
                 led_amplitude = status.led_amplitude;
                 heart
-                    .set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)
+                    .set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)
                     .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
             }
         }
