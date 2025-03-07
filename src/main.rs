@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     let i2c_device_clone = i2c_device.clone();
     let mut haptic = (|| {
         let mut haptic = drv2605::Drv2605::new(MutexDevice::new(&i2c_device_clone));
-        haptic.calibrate(CalibrationParams {
+        haptic.calibrate(drv2605::CalibrationParams {
             brake_factor: 2,
             loop_gain: 2,
             auto_cal_time: 4,
