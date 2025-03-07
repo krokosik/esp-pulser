@@ -10,10 +10,6 @@ use crate::{
 pub const MAX30102_NUM_SAMPLES: usize = 100;
 pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
 
-// const FIR_COEFFS: [u16; 12] = [
-//     172, 321, 579, 927, 1360, 1858, 2390, 2916, 3391, 3768, 4012, 4096,
-// ];
-
 pub struct Max3012SampleData {
     /// "AC" component of R/IR signal sample
     /// (sensor value - DC mean subtracted)
@@ -56,30 +52,26 @@ impl Max3012SampleData {
     }
 
     pub fn update_from_samples(&mut self, data: impl Iterator<Item = f32>) {
-        self.data_to_skip = data
-            .enumerate()
-            .fold((0, None::<f32>), |(res, prev), (i, x)| {
-                self.ac[i] = x;
-                if let Some(prev) = prev {
-                    if (x - prev).abs() > 100_000.0 {
-                        (i + 1, None)
-                    } else {
-                        (res, Some(x))
-                    }
-                } else {
-                    (res, Some(x))
-                }
-            })
-            .0;
+        // self.data_to_skip = data
+        //     .enumerate()
+        //     .fold((0, None::<f32>), |(res, prev), (i, x)| {
+        //         self.ac[i] = x;
+        //         if let Some(prev) = prev {
+        //             if (x - prev).abs() > 100_000.0 {
+        //                 (i + 1, Some(prev))
+        //             } else {
+        //                 (res, Some(x))
+        //             }
+        //         } else {
+        //             (res, Some(x))
+        //         }
+        //     })
+        //     .0;
 
-        self.data_to_skip = min(
-            if self.data_to_skip > 0 {
-                self.data_to_skip + 50
-            } else {
-                self.data_to_skip
-            },
-            MAX30102_NUM_SAMPLES,
-        );
+        // self.data_to_skip = 0;
+        for (i, x) in data.enumerate() {
+            self.ac[i] = x;
+        }
     }
 
     pub fn process_signal(&mut self) {
@@ -134,12 +126,4 @@ impl Max3012SampleData {
             }
         }
     }
-
-    // fn low_pass_FIR_filter(&mut self, data: &[f32], filter: &[f32]) -> f32 {
-    //     let mut result = 0.0;
-    //     for (i, &f) in filter.iter().enumerate() {
-    //         result += f * data[i];
-    //     }
-    //     result
-    // }
 }
