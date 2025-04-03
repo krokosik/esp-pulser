@@ -35,6 +35,7 @@ struct Status {
     haptic_ok: bool,
     heart_ok: bool,
     led_amplitude: u8,
+    haptic_amplitude: u8,
 }
 
 impl Status {
@@ -50,6 +51,7 @@ impl Status {
             haptic_ok: false,
             heart_ok: false,
             led_amplitude: 0,
+            haptic_amplitude: 0,
         }
     }
 }
@@ -77,6 +79,7 @@ fn main() -> Result<()> {
     let mut status = Status::new();
 
     let led_amplitude = nvs.get_u8("led_amplitude")?.unwrap_or(35);
+    let mut haptic_amplitude = nvs.get_u8("haptic_amp")?.unwrap_or(255);
     status.led_amplitude = led_amplitude;
 
     let peripherals = Peripherals::take()?;
@@ -108,7 +111,7 @@ fn main() -> Result<()> {
             brake_factor: 2,
             loop_gain: 2,
             auto_cal_time: 4,
-            overdrive_clamp_voltage: 255,
+            overdrive_clamp_voltage: haptic_amplitude,
             rated_voltage: 234,
         })?;
         haptic.init_open_loop_erm()?;
@@ -118,7 +121,9 @@ fn main() -> Result<()> {
     .ok();
 
     {
-        status.lock().unwrap().haptic_ok = haptic.is_some();
+        let mut status = status.lock().unwrap();
+        status.haptic_ok = haptic.is_some();
+        status.haptic_amplitude = haptic_amplitude;
     }
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
@@ -233,6 +238,24 @@ fn main() -> Result<()> {
             }
         } else {
             beat_triggered = false;
+        }
+
+        {
+            let status = status.lock().unwrap();
+            if status.haptic_amplitude != haptic_amplitude {
+                haptic_amplitude = status.haptic_amplitude;
+                if let Some(haptic) = haptic.as_mut() {
+                    haptic.calibrate(drv2605::CalibrationParams {
+                        brake_factor: 2,
+                        loop_gain: 2,
+                        auto_cal_time: 4,
+                        overdrive_clamp_voltage: haptic_amplitude,
+                        rated_voltage: 234,
+                    })?;
+                    haptic.init_open_loop_erm()?;
+                    haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
+                }
+            }
         }
 
         send_via_udp(
@@ -454,6 +477,12 @@ fn tcp_receiver_task(
                                     let udp_target = SocketAddr::new(addr.ip(), port);
                                     log::info!("Connecting to UDP socket at: {}", udp_target);
                                     udp_socket.lock().unwrap().connect(udp_target).unwrap();
+                                }
+                                4 => {
+                                    let haptic_amplitude = buf[1];
+                                    log::info!("Setting Motor amplitude to: {}", haptic_amplitude);
+                                    status.lock().unwrap().haptic_amplitude = haptic_amplitude;
+                                    nvs.set_u8("haptic_amp", haptic_amplitude).unwrap();
                                 }
                                 _ => {
                                     log::info!("Unknown command");

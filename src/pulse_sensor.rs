@@ -1,6 +1,5 @@
 use esp_idf_svc::hal::units::Hertz;
 use heapless::{binary_heap::Max, BinaryHeap, Vec};
-use std::cmp::min;
 
 use crate::{
     linreg::Linreg,
