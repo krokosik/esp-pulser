@@ -1,128 +1,253 @@
-use esp_idf_svc::hal::units::Hertz;
-use heapless::{binary_heap::Max, BinaryHeap, Vec};
+use std::{f32::consts::PI, time::Instant};
 
-use crate::{
-    linreg::Linreg,
-    signal::{Heartbeat, HeartbeatItr},
-};
+pub const SAMPLE_RATE: f32 = 400.0;
 
-pub const MAX30102_NUM_SAMPLES: usize = 100;
-pub const MAX30102_SAMPLE_RATE: Hertz = Hertz(25);
+const FINGER_THRESHOLD: f32 = 100_000.0;
+const FINGER_COOLDOWN_MS: u32 = 1000;
 
-pub struct Max3012SampleData {
-    /// "AC" component of R/IR signal sample
-    /// (sensor value - DC mean subtracted)
-    pub ac: [f32; MAX30102_NUM_SAMPLES],
+const EDGE_THRESHOLD: f32 = -2000.0;
 
-    /// "DC" mean of the sample
-    pub dc_mean: f32,
+const LP_CUT_OFF: f32 = 5.0;
+const HP_CUT_OFF: f32 = 0.5;
 
-    /// Number of samples to skip from the beginning of the data
-    /// (to ignore initial "junk" movement data)
-    pub data_to_skip: usize,
-
-    /// for scale, to display raw data
-    pub ac_max: f32,
-    pub ac_min: f32,
-
-    linreg: Linreg,
-
-    pub heartbeats: Vec<Heartbeat, 16>,
-
-    pub heart_rate_bpm: Option<f32>,
+pub struct HighPassFilter {
+    k_a0: f32,
+    k_a1: f32,
+    k_b1: f32,
+    last_filter_value: Option<f32>,
+    last_raw_value: Option<f32>,
 }
 
-impl Max3012SampleData {
-    pub fn new() -> Self {
-        Max3012SampleData {
-            ac: [0.0; MAX30102_NUM_SAMPLES],
-            dc_mean: 0.0,
-            data_to_skip: 0,
+impl HighPassFilter {
+    /// Create a new high-pass filter based on number of samples for decay
+    pub fn from_samples(samples: f32) -> Self {
+        let k_x = (-1.0 / samples).exp();
+        let k_a0 = (1.0 + k_x) / 2.0;
 
-            ac_max: 1.0,
-            ac_min: 0.0,
-
-            linreg: Linreg::new(MAX30102_NUM_SAMPLES),
-
-            heartbeats: Vec::new(),
-
-            heart_rate_bpm: None,
+        Self {
+            k_a0,
+            k_a1: -k_a0,
+            k_b1: k_x,
+            last_filter_value: None,
+            last_raw_value: None,
         }
     }
 
-    pub fn update_from_samples(&mut self, data: impl Iterator<Item = f32>) {
-        // self.data_to_skip = data
-        //     .enumerate()
-        //     .fold((0, None::<f32>), |(res, prev), (i, x)| {
-        //         self.ac[i] = x;
-        //         if let Some(prev) = prev {
-        //             if (x - prev).abs() > 100_000.0 {
-        //                 (i + 1, Some(prev))
-        //             } else {
-        //                 (res, Some(x))
-        //             }
-        //         } else {
-        //             (res, Some(x))
-        //         }
-        //     })
-        //     .0;
+    /// Create a new high-pass filter based on cutoff frequency
+    pub fn new(cutoff: f32, sampling_frequency: f32) -> Self {
+        Self::from_samples(sampling_frequency / (cutoff * 2.0 * PI))
+    }
 
-        // self.data_to_skip = 0;
-        for (i, x) in data.enumerate() {
-            self.ac[i] = x;
+    /// Process a new sample through the filter
+    pub fn run(&mut self, value: f32) -> f32 {
+        let filter_value = match (self.last_filter_value, self.last_raw_value) {
+            (None, _) | (_, None) => 0.0,
+            (Some(last_filter), Some(last_raw)) => {
+                self.k_a0 * value + self.k_a1 * last_raw + self.k_b1 * last_filter
+            }
+        };
+
+        self.last_filter_value = Some(filter_value);
+        self.last_raw_value = Some(value);
+
+        filter_value
+    }
+
+    /// Reset the filter state
+    pub fn reset_state(&mut self) {
+        self.last_filter_value = None;
+        self.last_raw_value = None;
+    }
+}
+
+pub struct LowPassFilter {
+    k_a0: f32,
+    k_b1: f32,
+    last_value: Option<f32>,
+}
+
+impl LowPassFilter {
+    /// Create a new low-pass filter based on number of samples for decay
+    pub fn from_samples(samples: f32) -> Self {
+        let k_x = (-1.0 / samples).exp();
+        let k_a0 = 1.0 - k_x;
+
+        Self {
+            k_a0,
+            k_b1: k_x,
+            last_value: None,
         }
     }
 
-    pub fn process_signal(&mut self) {
-        self.dc_mean = 0.0;
-        self.ac_max = f32::MIN;
-        self.ac_min = f32::MAX;
+    /// Create a new low-pass filter based on cutoff frequency
+    pub fn new(cutoff: f32, sampling_frequency: f32) -> Self {
+        Self::from_samples(sampling_frequency / (cutoff * 2.0 * PI))
+    }
 
-        self.linreg.update_from(&self.ac[self.data_to_skip..]);
+    /// Process a new sample through the filter
+    pub fn run(&mut self, value: f32) -> f32 {
+        let filter_value = match self.last_value {
+            None => value,
+            Some(last_value) => self.k_a0 * value + self.k_b1 * last_value,
+        };
 
-        for (i, ac) in self.ac.iter_mut().enumerate() {
-            if i < self.data_to_skip {
-                *ac = 0.0;
-            } else {
-                *ac -= self.linreg.y(i as f32);
-                self.ac_max = self.ac_max.max(*ac);
-                self.ac_min = self.ac_min.min(*ac);
+        self.last_value = Some(filter_value);
+        filter_value
+    }
+
+    /// Reset the filter state
+    pub fn reset_state(&mut self) {
+        self.last_value = None;
+    }
+}
+
+struct Differentiator {
+    prev: Option<f32>,
+    sampling_rate: f32,
+}
+
+impl Differentiator {
+    fn new() -> Self {
+        Differentiator {
+            prev: None,
+            sampling_rate: SAMPLE_RATE,
+        }
+    }
+
+    fn diff(&mut self, x: f32) -> Option<f32> {
+        match self.prev {
+            None => {
+                self.prev = Some(x);
+                None
+            }
+            Some(prev) => {
+                let res = (x - prev) * self.sampling_rate;
+                self.prev = Some(x);
+                Some(res)
             }
         }
+    }
+    fn reset_state(&mut self) {
+        self.prev = None;
+    }
+}
 
-        self.heartbeats.clear();
+pub struct SampleData {
+    pub last_heartbeat: Option<Instant>,
 
-        // Keep track of distances (in array indexes) between heartbeats
-        let mut hb_dist: BinaryHeap<usize, Max, 16> = BinaryHeap::new();
-        let mut last_hb_idx: Option<usize> = None;
-        let hb_threshold = (self.ac_max - self.ac_min) / 4.0;
-        for hb in HeartbeatItr::new(&self.ac) {
-            // Ignore small amplitude "wiggles", focus on larger transitions.
-            // This only works if overall signal is clean enough from motion
-            // artifacts (i.e. actual heartbeats stay relatively close to
-            // min/max amplitude values).
-            let hb_val_diff = hb.high_value - hb.low_value;
+    fingerprint_timestamp: Instant,
+    finger_detected: bool,
 
-            if hb_val_diff > hb_threshold {
-                let _ = self.heartbeats.push(hb);
-                if let Some(lhb) = last_hb_idx {
-                    let _ = hb_dist.push(hb.high_idx - lhb);
+    pub last_diff: Option<f32>,
+    crossed: bool,
+    crossed_time: Option<Instant>,
+
+    hp_filter: HighPassFilter,
+    lp_filter: LowPassFilter,
+    differentiator: Differentiator,
+
+    pub bpm: Option<f32>,
+}
+
+impl SampleData {
+    pub fn new() -> Self {
+        SampleData {
+            last_heartbeat: None,
+            fingerprint_timestamp: Instant::now(),
+            finger_detected: false,
+            last_diff: None,
+            crossed: false,
+            crossed_time: None,
+
+            hp_filter: HighPassFilter::new(HP_CUT_OFF, SAMPLE_RATE),
+            lp_filter: LowPassFilter::new(LP_CUT_OFF, SAMPLE_RATE),
+            differentiator: Differentiator::new(),
+
+            bpm: None,
+        }
+    }
+
+    pub fn run(&mut self, sample: f32) -> f32 {
+        let mut result_sample = sample;
+        if sample > FINGER_THRESHOLD {
+            if self.fingerprint_timestamp.elapsed().as_millis() > FINGER_COOLDOWN_MS as u128 {
+                self.finger_detected = true;
+            }
+        } else {
+            self.reset_state();
+        }
+
+        if self.finger_detected {
+            let sample = self.lp_filter.run(sample);
+            let sample = self.hp_filter.run(sample);
+            let diff = self.differentiator.diff(sample);
+
+            result_sample = sample;
+
+            if diff.is_some() && self.last_diff.is_some() {
+                let diff = diff.unwrap();
+                let last_diff = self.last_diff.unwrap();
+
+                if last_diff > 0.0 && diff < 0.0 {
+                    self.crossed = true;
+                    self.crossed_time = Some(Instant::now());
                 }
 
-                last_hb_idx = Some(hb.high_idx);
+                if diff > 0.0 {
+                    self.crossed = false;
+                }
+
+                if self.crossed && diff < EDGE_THRESHOLD {
+                    if self.last_heartbeat.is_some_and(|last_heartbeat| {
+                        self.crossed_time.is_some_and(|crossed_time| {
+                            crossed_time.duration_since(last_heartbeat).as_millis() > 300
+                        })
+                    }) {
+                        let bpm = 60_000
+                            / self
+                                .crossed_time
+                                .unwrap()
+                                .duration_since(self.last_heartbeat.unwrap())
+                                .as_millis();
+
+                        log::info!(
+                            "bpm: {} ibi: {}",
+                            bpm,
+                            self.crossed_time
+                                .unwrap()
+                                .duration_since(self.last_heartbeat.unwrap())
+                                .as_millis()
+                        );
+
+                        let bpm = bpm as f32;
+
+                        if bpm > 30.0 && bpm < 200.0 {
+                            self.bpm = Some(bpm);
+                        } else {
+                            self.bpm = None;
+                        }
+                    }
+                    self.crossed = false;
+                    self.last_heartbeat = self.crossed_time;
+                }
             }
+
+            self.last_diff = diff;
         }
 
-        self.heart_rate_bpm = None;
+        result_sample
+    }
 
-        if hb_dist.len() > 2 && self.linreg.intercept > 100_000.0 {
-            let mean_hb_dist = hb_dist.iter().sum::<usize>() as f32 / hb_dist.len() as f32;
+    fn reset_state(&mut self) {
+        self.hp_filter.reset_state();
+        self.lp_filter.reset_state();
+        self.differentiator.reset_state();
 
-            let bpm = 60.0 * MAX30102_SAMPLE_RATE.0 as f32 / mean_hb_dist;
-
-            if bpm < 180.0 && bpm > 60.0 {
-                self.heart_rate_bpm = Some(bpm);
-            }
-        }
+        self.last_heartbeat = None;
+        self.fingerprint_timestamp = Instant::now();
+        self.finger_detected = false;
+        self.last_diff = None;
+        self.crossed = false;
+        self.crossed_time = None;
     }
 }
