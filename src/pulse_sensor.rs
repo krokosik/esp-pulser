@@ -47,8 +47,10 @@ impl SampleData {
         }
     }
 
-    pub fn run(&mut self, sample: f32) -> f32 {
+    pub fn run(&mut self, sample: f32) -> (f32, bool) {
         let mut result_sample = sample;
+        let mut beat_detected = false;
+
         if sample > FINGER_THRESHOLD {
             if self.fingerprint_timestamp.elapsed().as_millis() > FINGER_COOLDOWN_MS as u128 {
                 self.finger_detected = true;
@@ -83,21 +85,13 @@ impl SampleData {
                             crossed_time.duration_since(last_heartbeat).as_millis() > 300
                         })
                     }) {
+                        beat_detected = true;
                         let bpm = 60_000
                             / self
                                 .crossed_time
                                 .unwrap()
                                 .duration_since(self.last_heartbeat.unwrap())
                                 .as_millis();
-
-                        log::info!(
-                            "bpm: {} ibi: {}",
-                            bpm,
-                            self.crossed_time
-                                .unwrap()
-                                .duration_since(self.last_heartbeat.unwrap())
-                                .as_millis()
-                        );
 
                         let bpm = bpm as f32;
 
@@ -115,7 +109,7 @@ impl SampleData {
             self.last_diff = diff;
         }
 
-        result_sample
+        (result_sample, beat_detected)
     }
 
     fn reset_state(&mut self) {
@@ -129,5 +123,6 @@ impl SampleData {
         self.last_diff = None;
         self.crossed = false;
         self.crossed_time = None;
+        self.bpm = None;
     }
 }

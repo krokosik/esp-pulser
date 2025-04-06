@@ -76,9 +76,10 @@ fn main() -> Result<()> {
 
     let mut status = Status::new();
 
-    let led_amplitude = nvs.get_u8("led_amplitude")?.unwrap_or(35);
-    let mut haptic_amplitude = nvs.get_u8("haptic_amp")?.unwrap_or(255);
+    let mut led_amplitude = nvs.get_u8("led_amplitude")?.unwrap_or(35);
     status.led_amplitude = led_amplitude;
+    let mut haptic_amplitude = nvs.get_u8("haptic_amp")?.unwrap_or(255);
+    status.haptic_amplitude = haptic_amplitude;
 
     let peripherals = Peripherals::take()?;
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
@@ -118,10 +119,30 @@ fn main() -> Result<()> {
     })()
     .ok();
 
+    let mut heart = (|| {
+        let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
+
+        let mut heart = heart.into_multi_led()?;
+        heart.set_led_time_slots([
+            max3010x::TimeSlot::Led1,
+            max3010x::TimeSlot::Disabled,
+            max3010x::TimeSlot::Disabled,
+            max3010x::TimeSlot::Disabled,
+        ])?;
+        heart.set_sample_averaging(max3010x::SampleAveraging::Sa4)?;
+        heart.set_sampling_rate(max3010x::SamplingRate::Sps1600)?;
+        heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
+        heart.set_pulse_width(max3010x::LedPulseWidth::Pw411)?;
+        heart.enable_fifo_rollover()?;
+        heart.clear_fifo()?;
+        anyhow::Ok(heart)
+    })()
+    .ok();
+
     {
         let mut status = status.lock().unwrap();
         status.haptic_ok = haptic.is_some();
-        status.haptic_amplitude = haptic_amplitude;
+        status.heart_ok = heart.is_some();
     }
 
     let udp_socket = Arc::new(Mutex::new(UdpSocket::bind(SocketAddrV4::new(
@@ -158,31 +179,49 @@ fn main() -> Result<()> {
             .spawn(move || status_log_thread(udp_socket, board.display_driver, status, ip_info))?;
     }
 
-    let trigger_heartbeat = Arc::new(AtomicBool::new(false));
+    let mut samples = SampleData::new();
+    let mut data = [0; 10];
+    let interval = Duration::from_micros(1_000_000 / SAMPLE_RATE as u64);
+    let mut counter = 0;
+    let counter_max = SAMPLE_RATE as i32 / 25;
 
-    {
-        let udp_socket = udp_socket.clone();
-        let i2c_device = i2c_device.clone();
-        let status = status.clone();
-        let trigger_heartbeat = trigger_heartbeat.clone();
-        thread::Builder::new().stack_size(4 * 1024).spawn(move || {
-            match heart_sensing_task(udp_socket, i2c_device, status.clone(), trigger_heartbeat) {
-                Ok(_) => (),
-                Err(e) => log::error!("Error in heart sensing task: {:?}", e),
-            }
-            status.lock().unwrap().heart_ok = false;
-        })?;
-    }
-
-    std::thread::sleep(Duration::from_millis(400));
+    log::info!("Starting heart rate sensing...");
 
     loop {
-        std::thread::sleep(Duration::from_millis(10));
+        let now = std::time::Instant::now();
 
-        if trigger_heartbeat.load(Ordering::Relaxed) {
-            trigger_heartbeat.store(false, Ordering::Relaxed);
-            if let Some(haptic) = haptic.as_mut() {
-                haptic.set_go(true)?;
+        if let Some(ref mut heart) = heart {
+            match heart.read_fifo(&mut data) {
+                Ok(samples_read) if samples_read > 0 => {
+                    counter += 1;
+                    let raw_sample = data[0] as f32;
+                    let (sample, beat_detected) = samples.run(raw_sample);
+
+                    if beat_detected && haptic.is_some() {
+                        haptic.as_mut().unwrap().set_go(true)?;
+                    }
+
+                    if counter == counter_max {
+                        counter = 0;
+                        send_via_udp(
+                            udp_socket.clone(),
+                            status.clone(),
+                            &Packet::RawHeartRate(raw_sample),
+                        );
+                        send_via_udp(
+                            udp_socket.clone(),
+                            status.clone(),
+                            &Packet::HeartRate(sample),
+                        );
+                        send_via_udp(
+                            udp_socket.clone(),
+                            status.clone(),
+                            &Packet::Bpm(samples.bpm.unwrap_or_default()),
+                        );
+                    }
+                }
+                Ok(_) => (),
+                Err(e) => log::error!("Error reading FIFO: {:?}", e),
             }
         }
 
@@ -202,97 +241,12 @@ fn main() -> Result<()> {
                     haptic.set_single_effect(drv2605::Effect::PulsingStrongOne100)?;
                 }
             }
-        }
-    }
-}
 
-fn heart_sensing_task(
-    udp_socket: Arc<Mutex<UdpSocket>>,
-    i2c_device: Arc<Mutex<I2cDriver>>,
-    status: Arc<Mutex<Status>>,
-    trigger_heartbeat: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
-    let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
-    let mut samples = SampleData::new();
-    let mut led_amplitude;
-
-    {
-        led_amplitude = status.lock().unwrap().led_amplitude;
-    }
-
-    // Fs = 25 Hz
-    let mut heart = heart.into_multi_led()?;
-    heart.set_led_time_slots([
-        max3010x::TimeSlot::Led1,
-        max3010x::TimeSlot::Disabled,
-        max3010x::TimeSlot::Disabled,
-        max3010x::TimeSlot::Disabled,
-    ])?;
-    heart.set_sample_averaging(max3010x::SampleAveraging::Sa4)?;
-    heart.set_sampling_rate(max3010x::SamplingRate::Sps1600)?;
-    heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
-    heart.set_pulse_width(max3010x::LedPulseWidth::Pw411)?;
-    heart.enable_fifo_rollover()?;
-    heart.clear_fifo()?;
-    let mut data = [0; 10];
-    let interval = Duration::from_micros(1_000_000 / SAMPLE_RATE as u64);
-
-    {
-        status.lock().unwrap().heart_ok = true;
-    }
-
-    log::info!("Starting heart rate sensing...");
-
-    let mut last_heartbeat = samples.last_heartbeat;
-    let mut counter = 0;
-    let counter_max = SAMPLE_RATE as i32 / 25;
-
-    loop {
-        let now = std::time::Instant::now();
-
-        match heart.read_fifo(&mut data) {
-            Ok(samples_read) if samples_read > 0 => {
-                counter += 1;
-                let raw_sample = data[0] as f32;
-                let sample = samples.run(raw_sample);
-
-                if counter == counter_max {
-                    counter = 0;
-                    send_via_udp(
-                        udp_socket.clone(),
-                        status.clone(),
-                        &Packet::RawHeartRate(raw_sample),
-                    );
-                    send_via_udp(
-                        udp_socket.clone(),
-                        status.clone(),
-                        &Packet::HeartRate(sample),
-                    );
-                    send_via_udp(
-                        udp_socket.clone(),
-                        status.clone(),
-                        &Packet::Bpm(samples.bpm.unwrap_or_default()),
-                    );
-                }
-            }
-            Ok(_) => (),
-            Err(e) => log::error!("Error reading FIFO: {:?}", e),
-        }
-
-        if samples.last_heartbeat != last_heartbeat {
-            last_heartbeat = samples.last_heartbeat;
-            if last_heartbeat.is_some() {
-                trigger_heartbeat.store(true, Ordering::Relaxed);
-            }
-        }
-
-        {
-            let status = status.lock().unwrap();
             if status.led_amplitude != led_amplitude {
                 led_amplitude = status.led_amplitude;
-                heart
-                    .set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)
-                    .map_err(|_| anyhow!("Heartbeat I2C disconnected"))?;
+                if let Some(heart) = heart.as_mut() {
+                    heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
+                }
             }
         }
 
