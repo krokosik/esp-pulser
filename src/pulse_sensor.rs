@@ -5,7 +5,7 @@ use crate::filters::*;
 pub const SAMPLE_RATE: f32 = 400.0;
 
 const FINGER_THRESHOLD: f32 = 100_000.0;
-const FINGER_COOLDOWN_MS: u32 = 1000;
+const FINGER_COOLDOWN_MS: u32 = 500;
 
 const EDGE_THRESHOLD: f32 = -2000.0;
 
@@ -85,7 +85,6 @@ impl SampleData {
                             crossed_time.duration_since(last_heartbeat).as_millis() > 300
                         })
                     }) {
-                        beat_detected = true;
                         let bpm = 60_000
                             / self
                                 .crossed_time
@@ -96,6 +95,7 @@ impl SampleData {
                         let bpm = bpm as f32;
 
                         if bpm > 30.0 && bpm < 200.0 {
+                            beat_detected = true;
                             self.bpm = Some(bpm);
                         } else {
                             self.bpm = None;

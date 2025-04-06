@@ -1,14 +1,11 @@
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use embedded_graphics::{mono_font::*, pixelcolor::Rgb565, prelude::*, text::*};
-use esp_idf_svc::hal::i2c::I2cDriver;
 use esp_idf_svc::ipv4::IpInfo;
 use esp_idf_svc::nvs::*;
 use http::Uri;
@@ -63,7 +60,7 @@ enum Packet {
     // Debug((f32, f32, f32)),
 }
 
-fn main() -> Result<()> {
+fn main() -> anyhow::Result<()> {
     // It is necessary to call this function once. Otherwise some patches to the runtime
     // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
     esp_idf_svc::sys::link_patches();
@@ -124,14 +121,14 @@ fn main() -> Result<()> {
 
         let mut heart = heart.into_multi_led()?;
         heart.set_led_time_slots([
-            max3010x::TimeSlot::Led3,
+            max3010x::TimeSlot::Led1,
             max3010x::TimeSlot::Disabled,
             max3010x::TimeSlot::Disabled,
             max3010x::TimeSlot::Disabled,
         ])?;
         heart.set_sample_averaging(max3010x::SampleAveraging::Sa4)?;
         heart.set_sampling_rate(max3010x::SamplingRate::Sps1600)?;
-        heart.set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)?;
+        heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
         heart.set_pulse_width(max3010x::LedPulseWidth::Pw411)?;
         heart.enable_fifo_rollover()?;
         heart.clear_fifo()?;
@@ -213,11 +210,11 @@ fn main() -> Result<()> {
                             status.clone(),
                             &Packet::HeartRate(sample),
                         );
-                        send_via_udp(
-                            udp_socket.clone(),
-                            status.clone(),
-                            &Packet::Bpm(samples.bpm.unwrap_or_default()),
-                        );
+                    }
+
+                    let bpm = samples.bpm.unwrap_or_default();
+                    if beat_detected || bpm == 0.0 {
+                        send_via_udp(udp_socket.clone(), status.clone(), &Packet::Bpm(bpm));
                     }
                 }
                 Ok(_) => (),
@@ -245,7 +242,7 @@ fn main() -> Result<()> {
             if status.led_amplitude != led_amplitude {
                 led_amplitude = status.led_amplitude;
                 if let Some(heart) = heart.as_mut() {
-                    heart.set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)?;
+                    heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
                 }
             }
         }
