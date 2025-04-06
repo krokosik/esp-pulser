@@ -1,6 +1,6 @@
 [package]
 name = "esp-pulser"
-version = "0.6.2"
+version = "0.6.3"
 authors = ["krokosik <krokosik@pm.me>"]
 edition = "2021"
 resolver = "2"
