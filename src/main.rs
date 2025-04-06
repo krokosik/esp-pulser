@@ -120,18 +120,18 @@ fn main() -> Result<()> {
     .ok();
 
     let mut heart = (|| {
-        let heart = Max3010x::new_max30102(MutexDevice::new(&*i2c_device));
+        let heart = Max3010x::new_max30101(MutexDevice::new(&*i2c_device));
 
         let mut heart = heart.into_multi_led()?;
         heart.set_led_time_slots([
-            max3010x::TimeSlot::Led1,
+            max3010x::TimeSlot::Led3,
             max3010x::TimeSlot::Disabled,
             max3010x::TimeSlot::Disabled,
             max3010x::TimeSlot::Disabled,
         ])?;
         heart.set_sample_averaging(max3010x::SampleAveraging::Sa4)?;
         heart.set_sampling_rate(max3010x::SamplingRate::Sps1600)?;
-        heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
+        heart.set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)?;
         heart.set_pulse_width(max3010x::LedPulseWidth::Pw411)?;
         heart.enable_fifo_rollover()?;
         heart.clear_fifo()?;
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
             if status.led_amplitude != led_amplitude {
                 led_amplitude = status.led_amplitude;
                 if let Some(heart) = heart.as_mut() {
-                    heart.set_pulse_amplitude(max3010x::Led::Led1, led_amplitude)?;
+                    heart.set_pulse_amplitude(max3010x::Led::Led3, led_amplitude)?;
                 }
             }
         }
