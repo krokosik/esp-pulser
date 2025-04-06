@@ -19,6 +19,7 @@ use esp_idf_svc::hal::{prelude::*, reset::restart, task::block_on};
 
 use esp_pulser::*;
 use pulse_sensor::{SampleData, SAMPLE_RATE};
+mod filters;
 mod ota;
 mod pulse_sensor;
 
