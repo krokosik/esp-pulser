@@ -373,6 +373,10 @@ fn tcp_receiver_task(
                                     if let Ok(u) = Uri::try_from(data) {
                                         ota::simple_download_and_update_firmware(u).unwrap();
                                     } else {
+                                        let update_url = ota::UPDATE_BIN_URL.replace("TAG", &data);
+                                        if let Ok(u) = Uri::try_from(update_url) {
+                                            ota::simple_download_and_update_firmware(u).unwrap();
+                                        }
                                         log::warn!("Invalid URL to download firmware");
                                     }
                                     restart();
