@@ -370,8 +370,7 @@ fn tcp_receiver_task(
                                 1 => {
                                     log::info!("Attempting update...");
                                     let data = String::from_utf8(buf[1..n].to_vec()).unwrap();
-                                    let update_url = ota::UPDATE_BIN_URL.replace("TAG", &data);
-                                    if let Ok(u) = Uri::try_from(update_url) {
+                                    if let Ok(u) = Uri::try_from(data) {
                                         ota::simple_download_and_update_firmware(u).unwrap();
                                     } else {
                                         log::warn!("Invalid URL to download firmware");
