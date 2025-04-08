@@ -353,7 +353,7 @@ fn tcp_receiver_task(
             Ok((mut stream, addr)) => {
                 log::info!("Connection from: {:?}", addr);
 
-                let mut buf = [0; 10];
+                let mut buf = [0; 1024];
                 loop {
                     match stream.read(&mut buf) {
                         Ok(0) => {
@@ -370,16 +370,19 @@ fn tcp_receiver_task(
                                 1 => {
                                     log::info!("Attempting update...");
                                     let data = String::from_utf8(buf[1..n].to_vec()).unwrap();
-                                    if let Ok(u) = Uri::try_from(data) {
-                                        ota::simple_download_and_update_firmware(u).unwrap();
-                                    } else {
-                                        let update_url = ota::UPDATE_BIN_URL.replace("TAG", &data);
-                                        if let Ok(u) = Uri::try_from(update_url) {
-                                            ota::simple_download_and_update_firmware(u).unwrap();
+                                    log::info!("Update URL: {}", data);
+                                    if let Ok(u) = Uri::try_from(&data) {
+                                        if ota::simple_download_and_update_firmware(u).is_ok() {
+                                            restart();
                                         }
-                                        log::warn!("Invalid URL to download firmware");
                                     }
-                                    restart();
+                                    let update_url = ota::UPDATE_BIN_URL.replace("TAG", &data);
+                                    if let Ok(u) = Uri::try_from(update_url) {
+                                        if ota::simple_download_and_update_firmware(u).is_ok() {
+                                            restart();
+                                        }
+                                    }
+                                    log::warn!("Invalid URL to download firmware");
                                 }
                                 2 => {
                                     let led_amplitude = buf[1];
