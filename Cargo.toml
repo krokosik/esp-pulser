@@ -38,6 +38,7 @@ max3010x = { git = "https://github.com/krokosik/max3010x-rs.git", version = "0.2
 embedded-hal-bus = { features = ["std"], version="0.2.0" }
 embedded-hal = "1.0.0"
 drv2605 = { git = "https://github.com/krokosik/drv2605.git", version = "0.2.0" }
+thiserror = "2.0.12"
 
 [build-dependencies]
 embuild = "0.33.0"
